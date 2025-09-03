@@ -46,7 +46,123 @@ const TRAP_FLAG = 1 << 8;
 // Maximum path length for module names
 const MAX_PATH = 260;
 
-// Debug event structures
+// PE constants
+const IMAGE_DOS_SIGNATURE = 0x5A4D; // MZ
+const IMAGE_NT_SIGNATURE = 0x00004550; // PE00
+const IMAGE_DIRECTORY_ENTRY_EXPORT = 0;
+const IMAGE_DIRECTORY_ENTRY_DEBUG = 6;
+const IMAGE_DEBUG_TYPE_CODEVIEW = 2;
+
+// PE structures
+const IMAGE_DOS_HEADER = extern struct {
+    e_magic: u16, // Magic number
+    e_cblp: u16, // Bytes on last page of file
+    e_cp: u16, // Pages in file
+    e_crlc: u16, // Relocations
+    e_cparhdr: u16, // Size of header in paragraphs
+    e_minalloc: u16, // Minimum extra paragraphs needed
+    e_maxalloc: u16, // Maximum extra paragraphs needed
+    e_ss: u16, // Initial relative SS value
+    e_sp: u16, // Initial SP value
+    e_csum: u16, // Checksum
+    e_ip: u16, // Initial IP value
+    e_cs: u16, // Initial relative CS value
+    e_lfarlc: u16, // File address of relocation table
+    e_ovno: u16, // Overlay number
+    e_res: [4]u16, // Reserved words
+    e_oemid: u16, // OEM identifier
+    e_oeminfo: u16, // OEM information
+    e_res2: [10]u16, // Reserved words
+    e_lfanew: i32, // File address of new exe header
+};
+
+const IMAGE_FILE_HEADER = extern struct {
+    Machine: u16,
+    NumberOfSections: u16,
+    TimeDateStamp: u32,
+    PointerToSymbolTable: u32,
+    NumberOfSymbols: u32,
+    SizeOfOptionalHeader: u16,
+    Characteristics: u16,
+};
+
+const IMAGE_DATA_DIRECTORY = extern struct {
+    VirtualAddress: u32,
+    Size: u32,
+};
+
+const IMAGE_OPTIONAL_HEADER64 = extern struct {
+    Magic: u16,
+    MajorLinkerVersion: u8,
+    MinorLinkerVersion: u8,
+    SizeOfCode: u32,
+    SizeOfInitializedData: u32,
+    SizeOfUninitializedData: u32,
+    AddressOfEntryPoint: u32,
+    BaseOfCode: u32,
+    ImageBase: u64,
+    SectionAlignment: u32,
+    FileAlignment: u32,
+    MajorOperatingSystemVersion: u16,
+    MinorOperatingSystemVersion: u16,
+    MajorImageVersion: u16,
+    MinorImageVersion: u16,
+    MajorSubsystemVersion: u16,
+    MinorSubsystemVersion: u16,
+    Win32VersionValue: u32,
+    SizeOfImage: u32,
+    SizeOfHeaders: u32,
+    CheckSum: u32,
+    Subsystem: u16,
+    DllCharacteristics: u16,
+    SizeOfStackReserve: u64,
+    SizeOfStackCommit: u64,
+    SizeOfHeapReserve: u64,
+    SizeOfHeapCommit: u64,
+    LoaderFlags: u32,
+    NumberOfRvaAndSizes: u32,
+    DataDirectory: [16]IMAGE_DATA_DIRECTORY,
+};
+
+const IMAGE_NT_HEADERS64 = extern struct {
+    Signature: u32,
+    FileHeader: IMAGE_FILE_HEADER,
+    OptionalHeader: IMAGE_OPTIONAL_HEADER64,
+};
+
+const IMAGE_EXPORT_DIRECTORY = extern struct {
+    Characteristics: u32,
+    TimeDateStamp: u32,
+    MajorVersion: u16,
+    MinorVersion: u16,
+    Name: u32,
+    Base: u32,
+    NumberOfFunctions: u32,
+    NumberOfNames: u32,
+    AddressOfFunctions: u32,
+    AddressOfNames: u32,
+    AddressOfNameOrdinals: u32,
+};
+
+const IMAGE_DEBUG_DIRECTORY = extern struct {
+    Characteristics: u32,
+    TimeDateStamp: u32,
+    MajorVersion: u16,
+    MinorVersion: u16,
+    Type: u32,
+    SizeOfData: u32,
+    AddressOfRawData: u32,
+    PointerToRawData: u32,
+};
+
+const PDB_INFO = extern struct {
+    signature: u32,
+    guid: [16]u8, // GUID as bytes
+    age: u32,
+    // Null terminated name goes after the end
+};
+
+// Debug event structures (keeping existing ones)
 const DEBUG_EVENT = extern struct {
     dwDebugEventCode: windows.DWORD,
     dwProcessId: windows.DWORD,
@@ -194,6 +310,286 @@ const AutoClosedHandle = struct {
     }
 };
 
+// Export target enumeration
+const ExportTarget = union(enum) {
+    RVA: u64,
+    Forwarder: []u8,
+
+    const Self = @This();
+
+    pub fn deinit(self: *Self, allocator: Allocator) void {
+        switch (self.*) {
+            .RVA => {},
+            .Forwarder => |name| allocator.free(name),
+        }
+    }
+};
+
+// Export structure
+const Export = struct {
+    name: ?[]u8,
+    ordinal: u32,
+    target: ExportTarget,
+
+    const Self = @This();
+
+    pub fn deinit(self: *Self, allocator: Allocator) void {
+        if (self.name) |name| {
+            allocator.free(name);
+        }
+        self.target.deinit(allocator);
+    }
+
+    pub fn toString(self: *const Self, allocator: Allocator) ![]u8 {
+        if (self.name) |name| {
+            return try allocator.dupe(u8, name);
+        } else {
+            return try std.fmt.allocPrint(allocator, "#{}", .{self.ordinal});
+        }
+    }
+};
+
+// Module structure
+const Module = struct {
+    base_address: u64,
+    size: u32,
+    name: []u8,
+    exports: ArrayList(Export),
+    pdb_name: ?[]u8,
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator, base_address: u64, name: ?[]const u8, process: windows.HANDLE) !Self {
+        var module = Self{
+            .base_address = base_address,
+            .size = 0,
+            .name = undefined,
+            .exports = ArrayList(Export).init(allocator),
+            .pdb_name = null,
+        };
+
+        // Read DOS header
+        const dos_header = readProcessMemoryData(IMAGE_DOS_HEADER, process, base_address) catch |err| {
+            print("Failed to read DOS header: {any}\n", .{err});
+            return err;
+        };
+
+        if (dos_header.e_magic != IMAGE_DOS_SIGNATURE) {
+            print("Invalid DOS signature\n", .{});
+            return error.InvalidDosSignature;
+        }
+
+        // Read PE header
+        const pe_header_addr = base_address + @as(u64, @intCast(dos_header.e_lfanew));
+        const pe_header = readProcessMemoryData(IMAGE_NT_HEADERS64, process, pe_header_addr) catch |err| {
+            print("Failed to read PE header: {any}\n", .{err});
+            return err;
+        };
+
+        if (pe_header.Signature != IMAGE_NT_SIGNATURE) {
+            print("Invalid PE signature\n", .{});
+            return error.InvalidPeSignature;
+        }
+
+        module.size = pe_header.OptionalHeader.SizeOfImage;
+
+        // Set module name
+        if (name) |n| {
+            module.name = try allocator.dupe(u8, n);
+        } else {
+            module.name = try allocator.dupe(u8, "unknown");
+        }
+
+        // Parse exports
+        try module.readExports(allocator, pe_header, process);
+
+        // Parse debug directory for PDB info
+        try module.readDebugInfo(allocator, pe_header, process);
+
+        return module;
+    }
+
+    pub fn deinit(self: *Self, allocator: Allocator) void {
+        allocator.free(self.name);
+        for (self.exports.items) |*exp| {
+            exp.deinit(allocator);
+        }
+        self.exports.deinit();
+        if (self.pdb_name) |pdb_name| {
+            allocator.free(pdb_name);
+        }
+    }
+
+    pub fn containsAddress(self: *const Self, address: u64) bool {
+        return address >= self.base_address and address < (self.base_address + self.size);
+    }
+
+    fn readExports(self: *Self, allocator: Allocator, pe_header: IMAGE_NT_HEADERS64, process: windows.HANDLE) !void {
+        const export_table_info = pe_header.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+        if (export_table_info.VirtualAddress == 0) {
+            return; // No exports
+        }
+
+        const export_table_addr = self.base_address + export_table_info.VirtualAddress;
+        const export_table_end = export_table_addr + export_table_info.Size;
+
+        const export_directory = readProcessMemoryData(IMAGE_EXPORT_DIRECTORY, process, export_table_addr) catch |err| {
+            print("Failed to read export directory: {any}\n", .{err});
+            return err;
+        };
+
+        // Update module name from exports if we don't have one
+        if (std.mem.eql(u8, self.name, "unknown") and export_directory.Name != 0) {
+            const name_addr = self.base_address + export_directory.Name;
+            const new_name = readProcessMemoryString(allocator, process, name_addr, 512, false) catch {
+                // Keep the old name if we can't read the new one
+                return;
+            };
+            allocator.free(self.name);
+            self.name = new_name;
+        }
+
+        // Read address table
+        const address_table_address = self.base_address + export_directory.AddressOfFunctions;
+        const address_table = readProcessMemoryArray(u32, allocator, process, address_table_address, export_directory.NumberOfFunctions) catch |err| {
+            print("Failed to read address table: {any}\n", .{err});
+            return err;
+        };
+        defer allocator.free(address_table);
+
+        // Read ordinal and name arrays
+        const ordinal_array_address = self.base_address + export_directory.AddressOfNameOrdinals;
+        const ordinal_array = readProcessMemoryArray(u16, allocator, process, ordinal_array_address, export_directory.NumberOfNames) catch |err| {
+            print("Failed to read ordinal array: {any}\n", .{err});
+            return err;
+        };
+        defer allocator.free(ordinal_array);
+
+        const name_array_address = self.base_address + export_directory.AddressOfNames;
+        const name_array = readProcessMemoryArray(u32, allocator, process, name_array_address, export_directory.NumberOfNames) catch |err| {
+            print("Failed to read name array: {any}\n", .{err});
+            return err;
+        };
+        defer allocator.free(name_array);
+
+        // Process each export
+        for (address_table, 0..) |function_address, unbiased_ordinal| {
+            const ordinal = export_directory.Base + @as(u32, @intCast(unbiased_ordinal));
+            const target_address = self.base_address + function_address;
+
+            // Find name for this ordinal
+            var export_name: ?[]u8 = null;
+            for (ordinal_array, 0..) |ord, name_idx| {
+                if (ord == @as(u16, @intCast(unbiased_ordinal))) {
+                    const name_address = self.base_address + name_array[name_idx];
+                    export_name = readProcessMemoryString(allocator, process, name_address, 4096, false) catch |err| {
+                        print("Failed to read export name: {any}\n", .{err});
+                        continue;
+                    };
+                    break;
+                }
+            }
+
+            // Check if this is a forwarder
+            var target: ExportTarget = undefined;
+            if (target_address >= export_table_addr and target_address < export_table_end) {
+                // This is a forwarder
+                const forwarding_name = readProcessMemoryString(allocator, process, target_address, 4096, false) catch |err| {
+                    print("Failed to read forwarder name: {any}\n", .{err});
+                    if (export_name) |name| allocator.free(name);
+                    continue;
+                };
+                target = ExportTarget{ .Forwarder = forwarding_name };
+            } else {
+                // Normal export
+                target = ExportTarget{ .RVA = target_address };
+            }
+
+            try self.exports.append(Export{
+                .name = export_name,
+                .ordinal = ordinal,
+                .target = target,
+            });
+        }
+    }
+
+    fn readDebugInfo(self: *Self, allocator: Allocator, pe_header: IMAGE_NT_HEADERS64, process: windows.HANDLE) !void {
+        const debug_table_info = pe_header.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
+        if (debug_table_info.VirtualAddress == 0) {
+            return; // No debug info
+        }
+
+        const dir_size = @sizeOf(IMAGE_DEBUG_DIRECTORY);
+        const count = @min(debug_table_info.Size / dir_size, 20); // Limit to 20 entries
+
+        for (0..count) |dir_index| {
+            const debug_directory_address = self.base_address + debug_table_info.VirtualAddress + (dir_index * dir_size);
+            const debug_directory = readProcessMemoryData(IMAGE_DEBUG_DIRECTORY, process, debug_directory_address) catch |err| {
+                print("Failed to read debug directory: {any}\n", .{err});
+                continue;
+            };
+
+            if (debug_directory.Type == IMAGE_DEBUG_TYPE_CODEVIEW) {
+                const pdb_info_address = self.base_address + debug_directory.AddressOfRawData;
+                // const pdb_info = readProcessMemoryData(PDB_INFO, process, pdb_info_address) catch |err| {
+                _ = readProcessMemoryData(PDB_INFO, process, pdb_info_address) catch |err| {
+                    print("Failed to read PDB info: {any}\n", .{err});
+                    continue;
+                };
+
+                // Read PDB name
+                const pdb_name_address = pdb_info_address + @sizeOf(PDB_INFO);
+                self.pdb_name = readProcessMemoryString(allocator, process, pdb_name_address, MAX_PATH, false) catch |err| {
+                    print("Failed to read PDB name: {any}\n", .{err});
+                    continue;
+                };
+
+                // We found the CodeView entry, so we're done
+                break;
+            }
+        }
+    }
+};
+
+// Process structure to track modules
+const Process = struct {
+    modules: ArrayList(Module),
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator) Self {
+        return Self{
+            .modules = ArrayList(Module).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *Self, allocator: Allocator) void {
+        for (self.modules.items) |*module| {
+            module.deinit(allocator);
+        }
+        self.modules.deinit();
+    }
+
+    pub fn addModule(self: *Self, allocator: Allocator, address: u64, name: ?[]const u8, process: windows.HANDLE) !*Module {
+        const module = Module.init(allocator, address, name, process) catch |err| {
+            print("Failed to create module: {any}\n", .{err});
+            return err;
+        };
+
+        try self.modules.append(module);
+        return &self.modules.items[self.modules.items.len - 1];
+    }
+
+    pub fn getContainingModule(self: *Self, address: u64) ?*Module {
+        for (self.modules.items) |*module| {
+            if (module.containsAddress(address)) {
+                return module;
+            }
+        }
+        return null;
+    }
+};
+
 // Expression types for evaluation
 const EvalExpr = union(enum) {
     Number: u64,
@@ -231,6 +627,7 @@ const Command = union(enum) {
     DisplayRegisters,
     DisplayBytes: u64, // address to display
     Evaluate: u64, // expression to evaluate
+    ListNearest: u64, // address to lookup nearest symbol
     Quit,
     Unknown,
 };
@@ -399,8 +796,6 @@ fn readCommand(allocator: Allocator) !Command {
 
     while (true) {
         print("> ", .{});
-        // Flush stdout to ensure the prompt appears
-        // std.io.getStdOut().writer().context.flush() catch {};
 
         var input_buffer: [256]u8 = undefined;
         if (stdin.readUntilDelimiterOrEof(&input_buffer, '\n')) |maybe_input| {
@@ -426,6 +821,15 @@ fn readCommand(allocator: Allocator) !Command {
                     defer expr.deinit(allocator);
                     const addr = expr.evaluate();
                     return Command{ .DisplayBytes = addr };
+                } else if (std.mem.startsWith(u8, trimmed, "ln ")) {
+                    const expr_text = trimmed[3..];
+                    var expr = parseExpression(allocator, expr_text) catch {
+                        print("Invalid expression in ln command\n", .{});
+                        continue;
+                    };
+                    defer expr.deinit(allocator);
+                    const addr = expr.evaluate();
+                    return Command{ .ListNearest = addr };
                 } else if (std.mem.startsWith(u8, trimmed, "? ")) {
                     const expr_text = trimmed[2..];
                     var expr = parseExpression(allocator, expr_text) catch {
@@ -442,6 +846,7 @@ fn readCommand(allocator: Allocator) !Command {
                     print("  g - go (continue)\n", .{});
                     print("  r - display registers\n", .{});
                     print("  db <addr> - display bytes at address\n", .{});
+                    print("  ln <addr> - list nearest symbol to address\n", .{});
                     print("  ? <expr> - evaluate expression\n", .{});
                     print("  q - quit\n", .{});
                     continue;
@@ -487,6 +892,24 @@ fn readProcessMemoryData(comptime T: type, process: windows.HANDLE, address: u64
     return data;
 }
 
+// Read an array from process memory
+fn readProcessMemoryArray(comptime T: type, allocator: Allocator, process: windows.HANDLE, address: u64, count: u32) ![]T {
+    const array = try allocator.alloc(T, count);
+    const bytes = std.mem.sliceAsBytes(array);
+    const bytes_read = readProcessMemoryBytes(process, address, bytes) catch {
+        allocator.free(array);
+        return error.ReadProcessMemoryFailed;
+    };
+
+    const expected_size = count * @sizeOf(T);
+    if (bytes_read != expected_size) {
+        allocator.free(array);
+        return error.IncompleteRead;
+    }
+
+    return array;
+}
+
 // Read a string from process memory
 fn readProcessMemoryString(allocator: Allocator, process: windows.HANDLE, address: u64, max_len: usize, is_wide: bool) ![]u8 {
     if (is_wide) {
@@ -530,6 +953,45 @@ fn readProcessMemoryString(allocator: Allocator, process: windows.HANDLE, addres
     }
 }
 
+// Resolve address to symbol name
+fn resolveAddressToName(allocator: Allocator, address: u64, process_info: *Process) !?[]u8 {
+    const module = process_info.getContainingModule(address) orelse return null;
+
+    var closest_export: ?*Export = null;
+    var closest_addr: u64 = 0;
+
+    // Find the closest export that comes before the address
+    for (module.exports.items) |*exp| {
+        switch (exp.target) {
+            .RVA => |export_addr| {
+                if (export_addr <= address) {
+                    if (closest_export == null or closest_addr < export_addr) {
+                        closest_export = exp;
+                        closest_addr = export_addr;
+                    }
+                }
+            },
+            .Forwarder => {
+                // Skip forwarders for now
+            },
+        }
+    }
+
+    if (closest_export) |exp| {
+        const offset = address - closest_addr;
+        const export_name = try exp.toString(allocator);
+        defer allocator.free(export_name);
+
+        if (offset == 0) {
+            return try std.fmt.allocPrint(allocator, "{s}!{s}", .{ module.name, export_name });
+        } else {
+            return try std.fmt.allocPrint(allocator, "{s}!{s}+0x{X}", .{ module.name, export_name, offset });
+        }
+    }
+
+    return null;
+}
+
 // Display all registers
 fn displayAllRegisters(context: windows.CONTEXT) void {
     print("rax=0x{x:0>16} rbx=0x{x:0>16} rcx=0x{x:0>16}\n", .{ context.Rax, context.Rbx, context.Rcx });
@@ -557,6 +1019,8 @@ fn displayBytes(process: windows.HANDLE, address: u64) void {
 
 fn mainDebuggerLoop(allocator: Allocator, process: windows.HANDLE) !void {
     var expect_step_exception = false;
+    var process_info = Process.init(allocator);
+    defer process_info.deinit(allocator);
 
     while (true) {
         var debug_event = std.mem.zeroes(DEBUG_EVENT);
@@ -584,32 +1048,58 @@ fn mainDebuggerLoop(allocator: Allocator, process: windows.HANDLE) !void {
                 }
             },
             CREATE_THREAD_DEBUG_EVENT => print("CreateThread\n", .{}),
-            CREATE_PROCESS_DEBUG_EVENT => print("CreateProcess\n", .{}),
+            CREATE_PROCESS_DEBUG_EVENT => {
+                const create_process = debug_event.u.CreateProcessInfo;
+                const dll_base = @intFromPtr(create_process.lpBaseOfImage);
+
+                // Get process name from image
+                var process_name: ?[]u8 = null;
+                defer if (process_name) |name| allocator.free(name);
+
+                if (create_process.lpImageName != null) {
+                    const dll_name_address = readProcessMemoryData(u64, process, @intFromPtr(create_process.lpImageName)) catch 0;
+
+                    if (dll_name_address != 0) {
+                        const is_wide = create_process.fUnicode != 0;
+                        process_name = readProcessMemoryString(allocator, process, dll_name_address, MAX_PATH, is_wide) catch null;
+                    }
+                }
+
+                _ = process_info.addModule(allocator, dll_base, process_name, process) catch |err| {
+                    print("Failed to add process module: {any}\n", .{err});
+                };
+
+                if (process_name) |name| {
+                    print("CreateProcess\nLoadDll: {x} {s}\n", .{ dll_base, name });
+                } else {
+                    print("CreateProcess\nLoadDll: {x}\n", .{dll_base});
+                }
+            },
             EXIT_THREAD_DEBUG_EVENT => print("ExitThread\n", .{}),
             EXIT_PROCESS_DEBUG_EVENT => print("ExitProcess\n", .{}),
             LOAD_DLL_DEBUG_EVENT => {
                 const load_dll = debug_event.u.LoadDll;
                 const dll_base = @intFromPtr(load_dll.lpBaseOfDll);
 
+                var dll_name: ?[]u8 = null;
+                defer if (dll_name) |name| allocator.free(name);
+
                 if (load_dll.lpImageName != null) {
                     // Read the pointer to the name string
-                    const dll_name_address = readProcessMemoryData(u64, process, @intFromPtr(load_dll.lpImageName)) catch {
-                        print("LoadDll: {x}\n", .{dll_base});
-                        continue;
-                    };
+                    const dll_name_address = readProcessMemoryData(u64, process, @intFromPtr(load_dll.lpImageName)) catch 0;
 
                     if (dll_name_address != 0) {
                         const is_wide = load_dll.fUnicode != 0;
-                        const dll_name = readProcessMemoryString(allocator, process, dll_name_address, MAX_PATH, is_wide) catch {
-                            print("LoadDll: {x}\n", .{dll_base});
-                            continue;
-                        };
-                        defer allocator.free(dll_name);
-
-                        print("LoadDll: {x} {s}\n", .{ dll_base, dll_name });
-                    } else {
-                        print("LoadDll: {x}\n", .{dll_base});
+                        dll_name = readProcessMemoryString(allocator, process, dll_name_address, MAX_PATH, is_wide) catch null;
                     }
+                }
+
+                _ = process_info.addModule(allocator, dll_base, dll_name, process) catch |err| {
+                    print("Failed to add module: {any}\n", .{err});
+                };
+
+                if (dll_name) |name| {
+                    print("LoadDll: {x} {s}\n", .{ dll_base, name });
                 } else {
                     print("LoadDll: {x}\n", .{dll_base});
                 }
@@ -662,7 +1152,15 @@ fn mainDebuggerLoop(allocator: Allocator, process: windows.HANDLE) !void {
         var continue_execution = false;
 
         while (!continue_execution) {
-            print("[{x}] 0x{x:0>16}\n", .{ debug_event.dwThreadId, ctx.context.Rip });
+            // Try to resolve the instruction pointer to a symbol
+            if (resolveAddressToName(allocator, ctx.context.Rip, &process_info)) |opSym| {
+                if (opSym) |sym| {
+                    print("[{x}] {s}\n", .{ debug_event.dwThreadId, sym });
+                    allocator.free(sym);
+                }
+            } else |_| {
+                print("[{x}] 0x{x:0>16}\n", .{ debug_event.dwThreadId, ctx.context.Rip });
+            }
 
             const cmd = readCommand(allocator) catch |err| {
                 print("Command parsing error: {any}\n", .{err});
@@ -688,6 +1186,16 @@ fn mainDebuggerLoop(allocator: Allocator, process: windows.HANDLE) !void {
                 },
                 Command.DisplayBytes => |address| {
                     displayBytes(process, address);
+                },
+                Command.ListNearest => |address| {
+                    if (resolveAddressToName(allocator, address, &process_info)) |opSym| {
+                        if (opSym) |sym| {
+                            print("{s}\n", .{sym});
+                            allocator.free(sym);
+                        }
+                    } else |_| {
+                        print("No symbol found\n", .{});
+                    }
                 },
                 Command.Evaluate => |value| {
                     print(" = 0x{x}\n", .{value});
