@@ -35,7 +35,7 @@ zig build test
 - [x] [Writing a Debugger From Scratch - DbgRs Part 2 - Register State and Stepping](https://www.timdbg.com/posts/writing-a-debugger-from-scratch-part-2/)
 - [x] [Writing a Debugger From Scratch - DbgRs Part 3 - Reading Memory](https://www.timdbg.com/posts/writing-a-debugger-from-scratch-part-3/)
 - [x] [Writing a Debugger From Scratch - DbgRs Part 4 - Exports and Private Symbols](https://www.timdbg.com/posts/writing-a-debugger-from-scratch-part-4/)
-- [ ] [Writing a Debugger From Scratch - DbgRs Part 5 - Breakpoints](https://www.timdbg.com/posts/writing-a-debugger-from-scratch-part-5/)
+- [x] [Writing a Debugger From Scratch - DbgRs Part 5 - Breakpoints](https://www.timdbg.com/posts/writing-a-debugger-from-scratch-part-5/)
 - [ ] [Writing a Debugger From Scratch - DbgRs Part 6 - Stacks](https://www.timdbg.com/posts/writing-a-debugger-from-scratch-part-6/)
 - [ ] [Writing a Debugger From Scratch - DbgRs Part 7 - Disassembly](https://www.timdbg.com/posts/writing-a-debugger-from-scratch-part-7/)
 - [ ] [Writing a Debugger From Scratch - DbgRs Part 8 - Source and Symbols](https://www.timdbg.com/posts/writing-a-debugger-from-scratch-part-8/)
