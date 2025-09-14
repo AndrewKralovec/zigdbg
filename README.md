@@ -14,12 +14,23 @@ While searching for a debugger for zig application, I came across WinDbg and eve
 - [Zig](https://ziglang.org/) (version 0.14.0 or later)
 - [Windows](https://www.microsoft.com/en-us/windows) (64-bit only)
 
-### Building
-
-To build the project, use the following command
+### Building and running
+To build and run an executable with the debugger, use the following command
 
 ```bash
-zig build
+zig build run -- hello_world.exe
+
+# Console prompt appears on debug events:
+[1234] 0x00007ff6a2b41000
+> help                    # Show available commands
+> r                       # Display all registers
+> k                       # Show stack trace
+> t                       # Single step execution
+> g                       # Continue execution
+> q                       # Quit debugger
+> db 0x00007ff6a2b41000   # Dump memory at address
+> bp 0x00007ff8d14ea65    # Set breakpoint
+> ? 0x1000 + 0x200        # Evaluate arithmetic expression
 ```
 
 ### Testing
@@ -36,34 +47,6 @@ zig build test
 - [x] [Writing a Debugger From Scratch - DbgRs Part 3 - Reading Memory](https://www.timdbg.com/posts/writing-a-debugger-from-scratch-part-3/)
 - [x] [Writing a Debugger From Scratch - DbgRs Part 4 - Exports and Private Symbols](https://www.timdbg.com/posts/writing-a-debugger-from-scratch-part-4/)
 - [x] [Writing a Debugger From Scratch - DbgRs Part 5 - Breakpoints](https://www.timdbg.com/posts/writing-a-debugger-from-scratch-part-5/)
-- [ ] [Writing a Debugger From Scratch - DbgRs Part 6 - Stacks](https://www.timdbg.com/posts/writing-a-debugger-from-scratch-part-6/)
+- [x] [Writing a Debugger From Scratch - DbgRs Part 6 - Stacks](https://www.timdbg.com/posts/writing-a-debugger-from-scratch-part-6/)
 - [ ] [Writing a Debugger From Scratch - DbgRs Part 7 - Disassembly](https://www.timdbg.com/posts/writing-a-debugger-from-scratch-part-7/)
 - [ ] [Writing a Debugger From Scratch - DbgRs Part 8 - Source and Symbols](https://www.timdbg.com/posts/writing-a-debugger-from-scratch-part-8/)
-
-
-## Development Notes
-
-### Debugger System Features
-- **Debugger Commands**: `t`, `g`, `r`, `bp`, `bc`, `bl`, `k`, `db`, `?`, `ln`, `q`, `help`
-- **Expression Parser**: Supports hex (`0x1234`), decimal (`123`), symbols (`module!symbol`), arithmetic (`expr + expr`)
-- **Register Display**: Complete x64 register dump with proper formatting
-- **Memory Inspection**: Hex dump with ASCII representation (`db 0x401000`)
-- **Single-Step Execution**: Step-into debugging with CPU trap flag
-- **Breakpoints**: Set, clear, and list breakpoints with address resolution
-- **Symbol Resolution**: Load and resolve symbols from PE exports
-- **Error Handling**: Comprehensive error reporting and command validation
-
-### Debugger Usage
-```bash
-zig build run -- hello_world.exe
-
-# Console prompt appears on debug events:
-[1234] 0x00007ff6a2b41000
-> help                    # Show available commands
-> r                       # Display all registers
-> db 0x00007ff6a2b41000   # Dump memory at address
-> ? 0x1000 + 0x200        # Evaluate arithmetic expression
-> t                       # Single step execution
-> g                       # Continue execution
-> q                       # Quit debugger
-```

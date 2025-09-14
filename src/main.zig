@@ -13,6 +13,7 @@ const breakpoint = @import("breakpoint.zig");
 const eval = @import("eval.zig");
 const stack = @import("stack.zig");
 const util = @import("util.zig");
+const name_resolution = @import("name_resolution.zig");
 
 const TRAP_FLAG: u32 = 1 << 8;
 
@@ -406,11 +407,19 @@ fn mainDebuggerLoop(process_handle: HANDLE, allocator: std.mem.Allocator) !void 
                         print("Failed to evaluate list nearest expression: {any}\n", .{err});
                         continue;
                     };
-                    print("TODO: List nearest symbols at 0x{x}\n", .{address});
-                    // TODO: Implement symbol listing when name_resolution.zig is ready
+                    if (name_resolution.resolveAddressToName(allocator, address, &proc)) |sym| {
+                        if (sym) |s| {
+                            print("{s}\n", .{s});
+                            allocator.free(s);
+                        } else {
+                            print("No symbol found\n", .{});
+                        }
+                    } else |_| {
+                        print("No symbol found\n", .{});
+                    }
                 },
                 .Quit => {
-                    print("Quitting debugger...\n", .{});
+                    print("Quitting debugger\n", .{});
                     return;
                 },
                 .Help => {
