@@ -5,7 +5,7 @@ const resolveNameToAddress = @import("./name_resolution.zig").resolveNameToAddre
 const print = std.debug.print;
 
 // Expression types for evaluation
-const EvalExpr = union(enum) {
+pub const EvalExpr = union(enum) {
     Number: u64,
     Symbol: []u8,
     Add: struct {
@@ -38,7 +38,7 @@ const EvalExpr = union(enum) {
 };
 
 // Simple expression parser
-fn parseExpression(allocator: Allocator, text: []const u8) !EvalExpr {
+pub fn parseExpression(allocator: Allocator, text: []const u8) !EvalExpr {
     const trimmed = std.mem.trim(u8, text, " \t");
 
     var i: usize = 0;

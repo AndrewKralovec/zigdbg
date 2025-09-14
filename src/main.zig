@@ -7,11 +7,11 @@ const WINAPI = windows.WINAPI;
 const event = @import("event.zig");
 const memory = @import("memory.zig");
 const process = @import("process.zig");
+const command = @import("command.zig");
+const registers = @import("registers.zig");
 // TODO: Import remaining modules when ported
 // const breakpoint = @import("breakpoint.zig");
-// const command = @import("command.zig");
 // const eval = @import("eval.zig");
-// const registers = @import("registers.zig");
 // const stack = @import("stack.zig");
 const util = @import("util.zig");
 
@@ -180,6 +180,44 @@ fn loadModuleAtAddress(proc: *process.Process, mem_source: memory.MemorySource, 
     print("LoadDll: {x}   {s}\n", .{ base_address, name });
 }
 
+fn displayMemoryBytes(mem_source: memory.MemorySource, address: u64, byte_count: usize, allocator: std.mem.Allocator) !void {
+    const bytes_to_read = @min(byte_count, 256);
+
+    const memory_bytes = mem_source.readRawMemory(address, bytes_to_read, allocator) catch |err| {
+        print("Failed to read memory at 0x{x}: {any}\n", .{ address, err });
+        return;
+    };
+    defer allocator.free(memory_bytes);
+
+    print("0x{x:0>16}  ", .{address});
+
+    // Display hex bytes
+    for (memory_bytes, 0..) |byte, i| {
+        print("{x:0>2} ", .{byte});
+        if ((i + 1) % 8 == 0) print(" ", .{});
+        if ((i + 1) % 16 == 0 and i + 1 < memory_bytes.len) {
+            print("\n0x{x:0>16}  ", .{address + i + 1});
+        }
+    }
+
+    // Pad if we have less than 16 bytes
+    const remaining = 16 - (memory_bytes.len % 16);
+    if (remaining < 16) {
+        for (0..remaining) |_| print("   ", .{});
+        if (memory_bytes.len <= 8) print(" ", .{});
+    }
+
+    print(" |", .{});
+
+    // Display ASCII representation
+    for (memory_bytes) |byte| {
+        const c = if (byte >= 32 and byte <= 126) byte else '.';
+        print("{c}", .{c});
+    }
+
+    print("|\\n", .{});
+}
+
 fn mainDebuggerLoop(process_handle: HANDLE, allocator: std.mem.Allocator) !void {
     var expect_step_exception = false;
     const mem_source = memory.makeLiveMemorySource(process_handle, allocator) catch |err| {
@@ -273,16 +311,95 @@ fn mainDebuggerLoop(process_handle: HANDLE, allocator: std.mem.Allocator) !void 
             },
         }
 
-        // For now, automatically continue execution
-        // TODO: Add command processing when command.zig is ported
-        var continue_execution = true;
+        // Interactive command processing
+        var continue_execution = false;
 
         while (!continue_execution) {
-            // TODO: Add command processing here
             print("[{x}] 0x{x:0>16}\n", .{ event_context.thread_id, ctx.context.Rip });
 
-            // For now, just continue
-            continue_execution = true;
+            const cmd = command.readCommand(allocator) catch |err| {
+                print("Error reading command: {any}\n", .{err});
+                continue;
+            };
+            defer {
+                var cmd_copy = cmd;
+                cmd_copy.deinit(allocator);
+            }
+
+            switch (cmd) {
+                .Go => {
+                    continue_execution = true;
+                },
+                .StepInto => {
+                    // Set single step flag
+                    ctx.context.EFlags |= TRAP_FLAG;
+                    expect_step_exception = true;
+                    const set_ctx_result = SetThreadContext(thread_handle.get(), &ctx.context);
+                    if (set_ctx_result == 0) {
+                        print("SetThreadContext failed\n", .{});
+                    }
+                    continue_execution = true;
+                },
+                .DisplayRegisters => {
+                    registers.displayAllRegisters(ctx.context);
+                },
+                .SetBreakpoint => |expr| {
+                    const address = expr.evaluate(allocator, &proc) catch |err| {
+                        print("Failed to evaluate breakpoint expression: {any}\n", .{err});
+                        continue;
+                    };
+                    print("TODO: Set breakpoint at 0x{x}\n", .{address});
+                    // TODO: Implement actual breakpoint setting when breakpoint.zig is ready
+                },
+                .ListBreakpoints => {
+                    print("TODO: List breakpoints\\n", .{});
+                    // TODO: Implement breakpoint listing when breakpoint.zig is ready
+                },
+                .ClearBreakpoint => |expr| {
+                    const address = expr.evaluate(allocator, &proc) catch |err| {
+                        print("Failed to evaluate clear breakpoint expression: {any}\n", .{err});
+                        continue;
+                    };
+                    print("TODO: Clear breakpoint at 0x{x}\n", .{address});
+                    // TODO: Implement breakpoint clearing when breakpoint.zig is ready
+                },
+                .StackWalk => {
+                    print("TODO: Stack walk\\n", .{});
+                    // TODO: Implement stack walk when stack.zig is ready
+                },
+                .DisplayBytes => |expr| {
+                    const address = expr.evaluate(allocator, &proc) catch |err| {
+                        print("Failed to evaluate memory display expression: {any}\n", .{err});
+                        continue;
+                    };
+                    displayMemoryBytes(mem_source, address, 16, allocator) catch |err| {
+                        print("Failed to display memory: {any}\n", .{err});
+                    };
+                },
+                .Evaluate => |expr| {
+                    const result = expr.evaluate(allocator, &proc) catch |err| {
+                        print("Failed to evaluate expression: {any}\n", .{err});
+                        continue;
+                    };
+                    print("0x{x} ({d})\n", .{ result, result });
+                },
+                .ListNearest => |expr| {
+                    const address = expr.evaluate(allocator, &proc) catch |err| {
+                        print("Failed to evaluate list nearest expression: {any}\n", .{err});
+                        continue;
+                    };
+                    print("TODO: List nearest symbols at 0x{x}\n", .{address});
+                    // TODO: Implement symbol listing when name_resolution.zig is ready
+                },
+                .Quit => {
+                    print("Quitting debugger...\\n", .{});
+                    return;
+                },
+                .Help => {
+                    command.displayHelp();
+                },
+                .Invalid => unreachable, // This should have been handled in readCommand
+            }
         }
 
         if (is_exit) {

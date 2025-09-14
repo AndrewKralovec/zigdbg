@@ -3,7 +3,7 @@ const print = std.debug.print;
 const windows = std.os.windows;
 
 // Display all registers
-fn displayAllRegisters(context: windows.CONTEXT) void {
+pub fn displayAllRegisters(context: windows.CONTEXT) void {
     print("rax=0x{x:0>16} rbx=0x{x:0>16} rcx=0x{x:0>16}\n", .{ context.Rax, context.Rbx, context.Rcx });
     print("rdx=0x{x:0>16} rsi=0x{x:0>16} rdi=0x{x:0>16}\n", .{ context.Rdx, context.Rsi, context.Rdi });
     print("rip=0x{x:0>16} rsp=0x{x:0>16} rbp=0x{x:0>16}\n", .{ context.Rip, context.Rsp, context.Rbp });
