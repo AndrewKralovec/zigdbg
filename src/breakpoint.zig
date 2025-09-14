@@ -180,31 +180,14 @@ pub const BreakpointManager = struct {
     }
 };
 
-// Helper function to set bits in a value
-fn setBits(comptime T: type, val: *T, set_val: T, start_bit: usize, bit_count: usize) void {
-    // First, mask out the relevant bits
-    const max_bits = @sizeOf(T) * 8;
-    var mask: T = std.math.maxInt(T) << @intCast(max_bits - bit_count);
-    mask = mask >> @intCast(max_bits - 1 - start_bit);
-    const inv_mask = ~mask;
-
-    val.* = val.* & inv_mask;
-    val.* = val.* | (set_val << @intCast(start_bit + 1 - bit_count));
+// Bit manipulation helper functions
+fn setBits(val: anytype, set_val: @TypeOf(val.*), start_bit: usize, bit_count: usize) void {
+    const T = @TypeOf(val.*);
+    const mask: T = (@as(T, 1) << @intCast(bit_count)) - 1;
+    const shifted_mask = mask << @intCast(start_bit);
+    val.* = (val.* & ~shifted_mask) | ((set_val & mask) << @intCast(start_bit));
 }
 
-// Overload for DWORD specifically (most common case)
-fn setBits(val: *DWORD, set_val: DWORD, start_bit: usize, bit_count: usize) void {
-    setBits(DWORD, val, set_val, start_bit, bit_count);
-}
-
-// Helper function to get a bit from a value
-fn getBit(comptime T: type, val: T, bit_index: usize) bool {
-    const mask: T = 1 << @intCast(bit_index);
-    const masked_val = val & mask;
-    return masked_val != 0;
-}
-
-// Overload for u64 specifically (common case for Dr6)
-fn getBit(val: u64, bit_index: usize) bool {
-    return getBit(u64, val, bit_index);
+fn getBit(val: u64, bit_pos: usize) bool {
+    return (val & (@as(u64, 1) << @intCast(bit_pos))) != 0;
 }
