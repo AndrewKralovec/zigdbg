@@ -6,6 +6,7 @@ const print = std.debug.print;
 const util = @import("util.zig");
 const memory = @import("memory.zig");
 const process = @import("process.zig");
+const name_resolution = @import("name_resolution.zig");
 
 // Windows API types and functions
 const HANDLE = windows.HANDLE;
@@ -98,10 +99,17 @@ pub const BreakpointManager = struct {
     }
 
     pub fn listBreakpoints(self: BreakpointManager, proc: *process.Process) void {
-        _ = proc; // TODO: Implement name resolution when available
         for (self.breakpoints.items) |bp| {
-            // TODO: Add name resolution when name_resolution module is ported
-            print("{:3} {X:0>18}\n", .{ bp.id, bp.addr });
+            if (name_resolution.resolveAddressToName(self.allocator, bp.addr, proc)) |sym_opt| {
+                if (sym_opt) |sym| {
+                    print("{:3} {X:0>18} ({})\n", .{ bp.id, bp.addr, sym });
+                    self.allocator.free(sym);
+                } else {
+                    print("{:3} {X:0>18}\n", .{ bp.id, bp.addr });
+                }
+            } else |_| {
+                print("{:3} {X:0>18}\n", .{ bp.id, bp.addr });
+            }
         }
     }
 
@@ -180,14 +188,23 @@ pub const BreakpointManager = struct {
     }
 };
 
-// Bit manipulation helper functions
+// Bit manipulation helper functions - matches the Rust implementation exactly
 fn setBits(val: anytype, set_val: @TypeOf(val.*), start_bit: usize, bit_count: usize) void {
     const T = @TypeOf(val.*);
-    const mask: T = (@as(T, 1) << @intCast(bit_count)) - 1;
-    const shifted_mask = mask << @intCast(start_bit);
-    val.* = (val.* & ~shifted_mask) | ((set_val & mask) << @intCast(start_bit));
+    const max_bits = @sizeOf(T) * 8;
+
+    // First, mask out the relevant bits
+    var mask: T = std.math.maxInt(T) << @intCast(max_bits - bit_count);
+    mask = mask >> @intCast(max_bits - 1 - start_bit);
+    const inv_mask = ~mask;
+
+    val.* = val.* & inv_mask;
+    val.* = val.* | (set_val << @intCast(start_bit + 1 - bit_count));
 }
 
-fn getBit(val: u64, bit_pos: usize) bool {
-    return (val & (@as(u64, 1) << @intCast(bit_pos))) != 0;
+fn getBit(val: anytype, bit_index: usize) bool {
+    const T = @TypeOf(val);
+    const mask: T = @as(T, 1) << @intCast(bit_index);
+    const masked_val = val & mask;
+    return masked_val != 0;
 }

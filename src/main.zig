@@ -215,7 +215,7 @@ fn displayMemoryBytes(mem_source: memory.MemorySource, address: u64, byte_count:
         print("{c}", .{c});
     }
 
-    print("|\\n", .{});
+    print("|\n", .{});
 }
 
 fn mainDebuggerLoop(process_handle: HANDLE, allocator: std.mem.Allocator) !void {
@@ -352,7 +352,7 @@ fn mainDebuggerLoop(process_handle: HANDLE, allocator: std.mem.Allocator) !void 
                     // TODO: Implement actual breakpoint setting when breakpoint.zig is ready
                 },
                 .ListBreakpoints => {
-                    print("TODO: List breakpoints\\n", .{});
+                    print("TODO: List breakpoints\n", .{});
                     // TODO: Implement breakpoint listing when breakpoint.zig is ready
                 },
                 .ClearBreakpoint => |expr| {
@@ -364,7 +364,7 @@ fn mainDebuggerLoop(process_handle: HANDLE, allocator: std.mem.Allocator) !void 
                     // TODO: Implement breakpoint clearing when breakpoint.zig is ready
                 },
                 .StackWalk => {
-                    print("TODO: Stack walk\\n", .{});
+                    print("TODO: Stack walk\n", .{});
                     // TODO: Implement stack walk when stack.zig is ready
                 },
                 .DisplayBytes => |expr| {
@@ -392,7 +392,7 @@ fn mainDebuggerLoop(process_handle: HANDLE, allocator: std.mem.Allocator) !void 
                     // TODO: Implement symbol listing when name_resolution.zig is ready
                 },
                 .Quit => {
-                    print("Quitting debugger...\\n", .{});
+                    print("Quitting debugger...\n", .{});
                     return;
                 },
                 .Help => {

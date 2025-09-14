@@ -138,22 +138,22 @@ pub fn readCommand(allocator: Allocator) !CommandExpr {
 
 // Display help information
 pub fn displayHelp() void {
-    print("Available commands:\\n", .{});
-    print("  t            - Step into (single step)\\n", .{});
-    print("  g            - Go (continue execution)\\n", .{});
-    print("  bp <expr>    - Set breakpoint at address/symbol\\n", .{});
-    print("  bl           - List breakpoints\\n", .{});
-    print("  bc <expr>    - Clear breakpoint\\n", .{});
-    print("  r            - Display registers\\n", .{});
-    print("  k            - Stack walk\\n", .{});
-    print("  db <expr>    - Display bytes at address\\n", .{});
-    print("  ? <expr>     - Evaluate expression\\n", .{});
-    print("  ln <expr>    - List nearest symbols\\n", .{});
-    print("  q            - Quit\\n", .{});
-    print("  help         - Show this help\\n", .{});
-    print("\\n", .{});
-    print("Expressions can be:\\n", .{});
-    print("  - Numbers: 123, 0x1234\\n", .{});
-    print("  - Symbols: module!symbol\\n", .{});
-    print("  - Arithmetic: expr + expr\\n", .{});
+    print("Available commands:\n", .{});
+    print("  t            - Step into (single step)\n", .{});
+    print("  g            - Go (continue execution)\n", .{});
+    print("  bp <expr>    - Set breakpoint at address/symbol\n", .{});
+    print("  bl           - List breakpoints\n", .{});
+    print("  bc <expr>    - Clear breakpoint\n", .{});
+    print("  r            - Display registers\n", .{});
+    print("  k            - Stack walk\n", .{});
+    print("  db <expr>    - Display bytes at address\n", .{});
+    print("  ? <expr>     - Evaluate expression\n", .{});
+    print("  ln <expr>    - List nearest symbols\n", .{});
+    print("  q            - Quit\n", .{});
+    print("  help         - Show this help\n", .{});
+    print("\n", .{});
+    print("Expressions can be:\n", .{});
+    print("  - Numbers: 123, 0x1234\n", .{});
+    print("  - Symbols: module!symbol\n", .{});
+    print("  - Arithmetic: expr + expr\n", .{});
 }

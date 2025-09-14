@@ -8,9 +8,9 @@ pub const Module = struct {
     address: u64,
     size: u64,
     allocator: std.mem.Allocator,
+    exports: std.ArrayList(Export),
 
     // TODO: Add these fields when implementing full PE parsing
-    // exports: []Export,
     // pdb_name: ?[]const u8,
     // pdb_info: ?PdbInfo,
     // pe_header: IMAGE_NT_HEADERS64,
@@ -35,11 +35,13 @@ pub const Module = struct {
             .address = address,
             .size = default_size,
             .allocator = allocator,
+            .exports = std.ArrayList(Export).init(allocator),
         };
     }
 
     pub fn deinit(self: *Module) void {
         self.allocator.free(self.name);
+        self.exports.deinit();
     }
 
     pub fn containsAddress(self: Module, address: u64) bool {
@@ -53,18 +55,22 @@ pub const Module = struct {
     // pub fn readExports(...)
 };
 
-// TODO: Implement these structures when adding full PE support
-// pub const Export = struct {
-//     name: ?[]const u8,
-//     ordinal: u32,
-//     target: ExportTarget,
-// };
-//
-// pub const ExportTarget = union(enum) {
-//     RVA: u64,
-//     Forwarder: []const u8,
-// };
-//
+pub const Export = struct {
+    name: ?[]const u8,
+    ordinal: u32,
+    target: ExportTarget,
+
+    pub fn toString(self: Export) []const u8 {
+        return if (self.name) |name| name else "unnamed";
+    }
+};
+
+pub const ExportTarget = union(enum) {
+    RVA: u64,
+    Forwarder: []const u8,
+};
+
+// TODO: Implement PDB support when needed
 // pub const PdbInfo = extern struct {
 //     signature: u32,
 //     guid: [16]u8, // GUID as bytes
