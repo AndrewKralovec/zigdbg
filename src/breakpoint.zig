@@ -37,17 +37,17 @@ extern "kernel32" fn SetThreadContext(
 ) callconv(WINAPI) BOOL;
 
 // Debug register bit positions and sizes
-const DR7_LEN_BIT = [_]usize{ 19, 23, 27, 31 };
-const DR7_RW_BIT = [_]usize{ 17, 21, 25, 29 };
-const DR7_LE_BIT = [_]usize{ 0, 2, 4, 6 };
-const DR7_GE_BIT = [_]usize{ 1, 3, 5, 7 };
+const DR7_LEN_BIT = [_]u6{ 19, 23, 27, 31 };
+const DR7_RW_BIT = [_]u6{ 17, 21, 25, 29 };
+const DR7_LE_BIT = [_]u6{ 0, 2, 4, 6 };
+const DR7_GE_BIT = [_]u6{ 1, 3, 5, 7 };
 
-const DR7_LEN_SIZE: usize = 2;
-const DR7_RW_SIZE: usize = 2;
+const DR7_LEN_SIZE: u6 = 2;
+const DR7_RW_SIZE: u6 = 2;
 
-const DR6_B_BIT = [_]usize{ 0, 1, 2, 3 };
+const DR6_B_BIT = [_]u6{ 0, 1, 2, 3 };
 
-const EFLAG_RF: usize = 16;
+const EFLAG_RF: u6 = 16;
 
 const Breakpoint = struct {
     addr: u64,
@@ -99,35 +99,68 @@ pub const BreakpointManager = struct {
     }
 
     pub fn listBreakpoints(self: BreakpointManager, proc: *process.Process) void {
+        if (self.breakpoints.items.len == 0) {
+            print("No breakpoints set\n", .{});
+            return;
+        }
+
+        print("ID  Address            Status    Symbol\n", .{});
+        print("--  ----------------   -------   ------\n", .{});
+
         for (self.breakpoints.items) |bp| {
+            const status = if (bp.id < 4) "Active" else "Invalid";
             if (name_resolution.resolveAddressToName(self.allocator, bp.addr, proc)) |sym_opt| {
                 if (sym_opt) |sym| {
-                    print("{:3} {X:0>18} ({})\n", .{ bp.id, bp.addr, sym });
+                    print("{:2}  0x{X:0>16} {s:>7}   {s}\n", .{ bp.id, bp.addr, status, sym });
                     self.allocator.free(sym);
                 } else {
-                    print("{:3} {X:0>18}\n", .{ bp.id, bp.addr });
+                    print("{:2}  0x{X:0>16} {s:>7}\n", .{ bp.id, bp.addr, status });
                 }
             } else |_| {
-                print("{:3} {X:0>18}\n", .{ bp.id, bp.addr });
+                print("{:2}  0x{X:0>16} {s:>7}\n", .{ bp.id, bp.addr, status });
             }
         }
+        print("\n", .{});
     }
 
-    pub fn clearBreakpoint(self: *BreakpointManager, id: u32) void {
+    pub fn clearBreakpointById(self: *BreakpointManager, id: u32) bool {
         var i: usize = 0;
         while (i < self.breakpoints.items.len) {
             if (self.breakpoints.items[i].id == id) {
                 _ = self.breakpoints.orderedRemove(i);
-                return;
+                return true;
             }
             i += 1;
         }
+        return false;
+    }
+
+    pub fn clearBreakpointByAddress(self: *BreakpointManager, addr: u64) bool {
+        var i: usize = 0;
+        while (i < self.breakpoints.items.len) {
+            if (self.breakpoints.items[i].addr == addr) {
+                _ = self.breakpoints.orderedRemove(i);
+                return true;
+            }
+            i += 1;
+        }
+        return false;
+    }
+
+    pub fn findBreakpointByAddress(self: BreakpointManager, addr: u64) ?u32 {
+        for (self.breakpoints.items) |bp| {
+            if (bp.addr == addr) {
+                return bp.id;
+            }
+        }
+        return null;
     }
 
     pub fn wasBreakpointHit(self: BreakpointManager, thread_context: *const CONTEXT) ?u32 {
         for (0..self.breakpoints.items.len) |idx| {
             if (getBit(thread_context.Dr6, DR6_B_BIT[idx])) {
-                return @intCast(idx);
+                // return @intCast(idx);
+                return self.breakpoints.items[idx].id;
             }
         }
         return null;
@@ -157,10 +190,12 @@ pub const BreakpointManager = struct {
             // Hardware breakpoints are limited to 4
             for (0..4) |idx| {
                 if (self.breakpoints.items.len > idx) {
+                    // Set LEN to 0 (1 byte), RW to 0 (execute), LE to 1 (enabled)
                     setBits(&ctx.context.Dr7, 0, DR7_LEN_BIT[idx], DR7_LEN_SIZE);
                     setBits(&ctx.context.Dr7, 0, DR7_RW_BIT[idx], DR7_RW_SIZE);
                     setBits(&ctx.context.Dr7, 1, DR7_LE_BIT[idx], 1);
 
+                    // Set the breakpoint address
                     switch (idx) {
                         0 => ctx.context.Dr0 = self.breakpoints.items[idx].addr,
                         1 => ctx.context.Dr1 = self.breakpoints.items[idx].addr,
@@ -169,13 +204,14 @@ pub const BreakpointManager = struct {
                         else => {},
                     }
                 } else {
-                    // Disable unused breakpoint slots
+                    // Disable unused breakpoints
                     setBits(&ctx.context.Dr7, 0, DR7_LE_BIT[idx], 1);
                     break;
                 }
             }
 
             // Prevent current thread from hitting breakpoint on current instruction
+            // Set resume flag for the thread that caused the break
             if (thread_id == resume_thread_id) {
                 setBits(&ctx.context.EFlags, 1, EFLAG_RF, 1);
             }
@@ -188,23 +224,14 @@ pub const BreakpointManager = struct {
     }
 };
 
-// Bit manipulation helper functions - matches the Rust implementation exactly
+// Bit manipulation helper functions
 fn setBits(val: anytype, set_val: @TypeOf(val.*), start_bit: usize, bit_count: usize) void {
     const T = @TypeOf(val.*);
-    const max_bits = @sizeOf(T) * 8;
-
-    // First, mask out the relevant bits
-    var mask: T = std.math.maxInt(T) << @intCast(max_bits - bit_count);
-    mask = mask >> @intCast(max_bits - 1 - start_bit);
-    const inv_mask = ~mask;
-
-    val.* = val.* & inv_mask;
-    val.* = val.* | (set_val << @intCast(start_bit + 1 - bit_count));
+    const mask: T = (@as(T, 1) << @intCast(bit_count)) - 1;
+    const shifted_mask = mask << @intCast(start_bit);
+    val.* = (val.* & ~shifted_mask) | ((set_val & mask) << @intCast(start_bit));
 }
 
-fn getBit(val: anytype, bit_index: usize) bool {
-    const T = @TypeOf(val);
-    const mask: T = @as(T, 1) << @intCast(bit_index);
-    const masked_val = val & mask;
-    return masked_val != 0;
+fn getBit(val: u64, bit_pos: usize) bool {
+    return (val & (@as(u64, 1) << @intCast(bit_pos))) != 0;
 }

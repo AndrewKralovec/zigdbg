@@ -22,32 +22,32 @@ extern "kernel32" fn ReadProcessMemory(
 // MemorySource trait equivalent - using interface pattern in Zig
 pub const MemorySource = struct {
     const Self = @This();
-
+    
     ptr: *anyopaque,
     vtable: *const VTable,
-
+    
     const VTable = struct {
-        readMemory: *const fn (ptr: *anyopaque, address: u64, len: usize, allocator: std.mem.Allocator) anyerror![]?u8,
-        readRawMemory: *const fn (ptr: *anyopaque, address: u64, len: usize, allocator: std.mem.Allocator) anyerror![]u8,
-        deinit: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator) void,
+        readMemory: *const fn(ptr: *anyopaque, address: u64, len: usize, allocator: std.mem.Allocator) anyerror![]?u8,
+        readRawMemory: *const fn(ptr: *anyopaque, address: u64, len: usize, allocator: std.mem.Allocator) anyerror![]u8,
+        deinit: *const fn(ptr: *anyopaque, allocator: std.mem.Allocator) void,
     };
-
+    
     pub fn init(implementation: anytype, allocator: std.mem.Allocator) !MemorySource {
         const T = @TypeOf(implementation);
         const ptr = try allocator.create(T);
         ptr.* = implementation;
-
+        
         const gen = struct {
             fn readMemory(pointer: *anyopaque, address: u64, len: usize, alloc: std.mem.Allocator) anyerror![]?u8 {
                 const self: *T = @ptrCast(@alignCast(pointer));
                 return self.readMemory(address, len, alloc);
             }
-
+            
             fn readRawMemory(pointer: *anyopaque, address: u64, len: usize, alloc: std.mem.Allocator) anyerror![]u8 {
                 const self: *T = @ptrCast(@alignCast(pointer));
                 return self.readRawMemory(address, len, alloc);
             }
-
+            
             fn deinit(pointer: *anyopaque, alloc: std.mem.Allocator) void {
                 const self: *T = @ptrCast(@alignCast(pointer));
                 if (@hasDecl(T, "deinit")) {
@@ -56,7 +56,7 @@ pub const MemorySource = struct {
                 alloc.destroy(self);
             }
         };
-
+        
         return MemorySource{
             .ptr = ptr,
             .vtable = &.{
@@ -66,16 +66,16 @@ pub const MemorySource = struct {
             },
         };
     }
-
+    
     pub fn deinit(self: MemorySource, allocator: std.mem.Allocator) void {
         self.vtable.deinit(self.ptr, allocator);
     }
-
+    
     // Read up to "len" bytes, return slice of optionals to represent available bytes
     pub fn readMemory(self: MemorySource, address: u64, len: usize, allocator: std.mem.Allocator) ![]?u8 {
         return self.vtable.readMemory(self.ptr, address, len, allocator);
     }
-
+    
     // Read up to "len" bytes, stop at first failure
     pub fn readRawMemory(self: MemorySource, address: u64, len: usize, allocator: std.mem.Allocator) ![]u8 {
         return self.vtable.readRawMemory(self.ptr, address, len, allocator);
@@ -88,18 +88,18 @@ pub fn readMemoryArray(comptime T: type, source: MemorySource, address: u64, max
     const max_bytes = max_count * element_size;
     const raw_bytes = try source.readRawMemory(address, max_bytes, allocator);
     defer allocator.free(raw_bytes);
-
+    
     var data = std.ArrayList(T).init(allocator);
     defer data.deinit();
-
+    
     var offset: usize = 0;
     while (offset + element_size <= raw_bytes.len) {
         var item: T = undefined;
-        @memcpy(std.mem.asBytes(&item), raw_bytes[offset .. offset + element_size]);
+        @memcpy(std.mem.asBytes(&item), raw_bytes[offset..offset + element_size]);
         try data.append(item);
         offset += element_size;
     }
-
+    
     return data.toOwnedSlice();
 }
 
@@ -125,7 +125,7 @@ pub fn readMemoryString(source: MemorySource, address: u64, max_count: usize, is
     if (is_wide) {
         const words = try readMemoryArray(u16, source, address, max_count, allocator);
         defer allocator.free(words);
-
+        
         // Find null terminator
         var null_pos: usize = words.len;
         for (words, 0..) |word, i| {
@@ -134,12 +134,12 @@ pub fn readMemoryString(source: MemorySource, address: u64, max_count: usize, is
                 break;
             }
         }
-
+        
         // Convert UTF-16 to UTF-8
         return std.unicode.utf16LeToUtf8Alloc(allocator, words[0..null_pos]);
     } else {
         const bytes = try readMemoryArray(u8, source, address, max_count, allocator);
-
+        
         // Find null terminator
         var null_pos: usize = bytes.len;
         for (bytes, 0..) |byte, i| {
@@ -148,7 +148,7 @@ pub fn readMemoryString(source: MemorySource, address: u64, max_count: usize, is
                 break;
             }
         }
-
+        
         // Create a copy of the string (without null terminator)
         const result = try allocator.alloc(u8, null_pos);
         @memcpy(result, bytes[0..null_pos]);
@@ -166,20 +166,20 @@ pub fn readMemoryStringIndirect(source: MemorySource, address: u64, max_count: u
 // Live memory source - reads from a running process
 const LiveMemorySource = struct {
     hprocess: HANDLE,
-
+    
     pub fn readMemory(self: *LiveMemorySource, address: u64, len: usize, allocator: std.mem.Allocator) ![]?u8 {
         var data = try allocator.alloc(?u8, len);
         @memset(data, null);
-
+        
         const buffer = try allocator.alloc(u8, len);
         defer allocator.free(buffer);
-
+        
         var offset: usize = 0;
         while (offset < len) {
             var bytes_read: SIZE_T = 0;
             const len_left = len - offset;
             const cur_address = address + offset;
-
+            
             const result = ReadProcessMemory(
                 self.hprocess,
                 @ptrFromInt(cur_address),
@@ -187,12 +187,12 @@ const LiveMemorySource = struct {
                 len_left,
                 &bytes_read,
             );
-
+            
             if (result == 0) {
                 // Failed to read, but we might have read some bytes successfully before this point
                 break;
             }
-
+            
             // Copy successfully read bytes to our result
             for (0..bytes_read) |i| {
                 const data_index = offset + i;
@@ -200,21 +200,21 @@ const LiveMemorySource = struct {
                     data[data_index] = buffer[i];
                 }
             }
-
+            
             if (bytes_read > 0) {
                 offset += bytes_read;
             } else {
                 offset += 1; // Skip to next byte if we can't read at current position
             }
         }
-
+        
         return data;
     }
-
+    
     pub fn readRawMemory(self: *LiveMemorySource, address: u64, len: usize, allocator: std.mem.Allocator) ![]u8 {
         const buffer = try allocator.alloc(u8, len);
         var bytes_read: SIZE_T = 0;
-
+        
         const result = ReadProcessMemory(
             self.hprocess,
             @ptrFromInt(address),
@@ -222,12 +222,12 @@ const LiveMemorySource = struct {
             len,
             &bytes_read,
         );
-
+        
         if (result == 0 or bytes_read == 0) {
             allocator.free(buffer);
             return allocator.alloc(u8, 0); // Return empty slice on failure
         }
-
+        
         // Resize buffer to actual bytes read
         const actual_data = try allocator.realloc(buffer, bytes_read);
         return actual_data;

@@ -9,10 +9,9 @@ const memory = @import("memory.zig");
 const process = @import("process.zig");
 const command = @import("command.zig");
 const registers = @import("registers.zig");
-// TODO: Import remaining modules when ported
-// const breakpoint = @import("breakpoint.zig");
-// const eval = @import("eval.zig");
-// const stack = @import("stack.zig");
+const breakpoint = @import("breakpoint.zig");
+const eval = @import("eval.zig");
+const stack = @import("stack.zig");
 const util = @import("util.zig");
 
 const TRAP_FLAG: u32 = 1 << 8;
@@ -229,8 +228,8 @@ fn mainDebuggerLoop(process_handle: HANDLE, allocator: std.mem.Allocator) !void 
     var proc = process.Process.init(allocator);
     defer proc.deinit();
 
-    // TODO: Add breakpoint manager when breakpoint.zig is ported
-    // var breakpoints = BreakpointManager.init();
+    var breakpoints = breakpoint.BreakpointManager.init(allocator);
+    defer breakpoints.deinit();
 
     while (true) {
         const event_result = event.waitForNextDebugEvent(allocator, mem_source) catch |err| {
@@ -275,11 +274,10 @@ fn mainDebuggerLoop(process_handle: HANDLE, allocator: std.mem.Allocator) !void 
                 if (expect_step_exception and exc.exception_code == EXCEPTION_SINGLE_STEP) {
                     expect_step_exception = false;
                     continue_status = DBG_CONTINUE;
+                } else if (breakpoints.wasBreakpointHit(&ctx.context)) |bp_index| {
+                    print("Breakpoint {} hit\n", .{bp_index});
+                    continue_status = DBG_CONTINUE;
                 } else {
-                    // TODO: Add breakpoint checking when breakpoint.zig is ported
-                    // } else if (breakpoints.wasBreakpointHit(&ctx.context)) |bp_index| {
-                    //     print("Breakpoint {} hit\n", .{bp_index});
-                    //     continue_status = DBG_CONTINUE;
                     print("Exception code {x} ({s})\n", .{ @as(u32, @bitCast(exc.exception_code)), chance_string });
                     continue_status = DBG_EXCEPTION_NOT_HANDLED;
                 }
@@ -348,24 +346,44 @@ fn mainDebuggerLoop(process_handle: HANDLE, allocator: std.mem.Allocator) !void 
                         print("Failed to evaluate breakpoint expression: {any}\n", .{err});
                         continue;
                     };
-                    print("TODO: Set breakpoint at 0x{x}\n", .{address});
-                    // TODO: Implement actual breakpoint setting when breakpoint.zig is ready
+                    breakpoints.addBreakpoint(address) catch |err| {
+                        print("Failed to set breakpoint: {any}\n", .{err});
+                        continue;
+                    };
+                    print("Breakpoint set at 0x{x}\n", .{address});
                 },
                 .ListBreakpoints => {
-                    print("TODO: List breakpoints\n", .{});
-                    // TODO: Implement breakpoint listing when breakpoint.zig is ready
+                    breakpoints.listBreakpoints(&proc);
                 },
                 .ClearBreakpoint => |expr| {
-                    const address = expr.evaluate(allocator, &proc) catch |err| {
+                    const value = expr.evaluate(allocator, &proc) catch |err| {
                         print("Failed to evaluate clear breakpoint expression: {any}\n", .{err});
                         continue;
                     };
-                    print("TODO: Clear breakpoint at 0x{x}\n", .{address});
-                    // TODO: Implement breakpoint clearing when breakpoint.zig is ready
+
+                    // Try to clear by address first, then by ID
+                    var cleared = false;
+                    if (breakpoints.findBreakpointByAddress(value)) |bp_id| {
+                        cleared = breakpoints.clearBreakpointById(bp_id);
+                        if (cleared) {
+                            print("Breakpoint {} (at 0x{x}) cleared\n", .{ bp_id, value });
+                        }
+                    } else if (value <= 3) { // If value is 0-3, treat as breakpoint ID
+                        const bp_id = @as(u32, @intCast(value));
+                        cleared = breakpoints.clearBreakpointById(bp_id);
+                        if (cleared) {
+                            print("Breakpoint {} cleared\n", .{bp_id});
+                        }
+                    }
+
+                    if (!cleared) {
+                        print("No breakpoint found at address 0x{x} or with ID {}\n", .{ value, value });
+                    }
                 },
                 .StackWalk => {
-                    print("TODO: Stack walk\n", .{});
-                    // TODO: Implement stack walk when stack.zig is ready
+                    stack.walkStack(allocator, &proc, ctx.context, mem_source) catch |err| {
+                        print("Stack walk failed: {any}\n", .{err});
+                    };
                 },
                 .DisplayBytes => |expr| {
                     const address = expr.evaluate(allocator, &proc) catch |err| {
@@ -406,8 +424,7 @@ fn mainDebuggerLoop(process_handle: HANDLE, allocator: std.mem.Allocator) !void 
             break;
         }
 
-        // TODO: Apply breakpoints when breakpoint.zig is ported
-        // breakpoints.applyBreakpoints(&proc, event_context.thread_id, mem_source);
+        breakpoints.applyBreakpoints(&proc, event_context.thread_id, mem_source);
 
         const continue_result = ContinueDebugEvent(
             event_context.process_id,

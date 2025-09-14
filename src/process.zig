@@ -6,7 +6,7 @@ pub const Process = struct {
     module_list: std.ArrayList(Module),
     thread_list: std.ArrayList(u32),
     allocator: std.mem.Allocator,
-
+    
     pub fn init(allocator: std.mem.Allocator) Process {
         return Process{
             .module_list = std.ArrayList(Module).init(allocator),
@@ -14,7 +14,7 @@ pub const Process = struct {
             .allocator = allocator,
         };
     }
-
+    
     pub fn deinit(self: *Process) void {
         // Clean up all modules
         for (self.module_list.items) |*module| {
@@ -23,17 +23,17 @@ pub const Process = struct {
         self.module_list.deinit();
         self.thread_list.deinit();
     }
-
+    
     pub fn addModule(self: *Process, address: u64, name: ?[]const u8, mem_source: memory.MemorySource) !*Module {
         const module = try Module.init(self.allocator, address, name, mem_source);
         try self.module_list.append(module);
         return &self.module_list.items[self.module_list.items.len - 1];
     }
-
+    
     pub fn addThread(self: *Process, thread_id: u32) !void {
         try self.thread_list.append(thread_id);
     }
-
+    
     pub fn removeThread(self: *Process, thread_id: u32) void {
         var i: usize = 0;
         while (i < self.thread_list.items.len) {
@@ -44,11 +44,11 @@ pub const Process = struct {
             i += 1;
         }
     }
-
+    
     pub fn iterateThreads(self: Process) []const u32 {
         return self.thread_list.items;
     }
-
+    
     pub fn getContainingModule(self: Process, address: u64) ?*const Module {
         for (self.module_list.items) |*module| {
             if (module.containsAddress(address)) {
@@ -57,7 +57,7 @@ pub const Process = struct {
         }
         return null;
     }
-
+    
     pub fn getContainingModuleMut(self: *Process, address: u64) ?*Module {
         for (self.module_list.items) |*module| {
             if (module.containsAddress(address)) {
@@ -66,16 +66,16 @@ pub const Process = struct {
         }
         return null;
     }
-
+    
     pub fn getModuleByNameMut(self: *Process, module_name: []const u8) ?*Module {
         var potential_trimmed_match: ?*Module = null;
-
+        
         for (self.module_list.items) |*module| {
             // Exact match
             if (std.mem.eql(u8, module.name, module_name)) {
                 return module;
             }
-
+            
             // If no exact match yet, try trimmed match (filename only)
             if (potential_trimmed_match == null) {
                 // Find the last backslash or forward slash
@@ -85,16 +85,16 @@ pub const Process = struct {
                         last_sep = i;
                     }
                 }
-
-                const trimmed = if (last_sep) |sep| module.name[sep + 1 ..] else module.name;
-
+                
+                const trimmed = if (last_sep) |sep| module.name[sep + 1..] else module.name;
+                
                 // Case-insensitive comparison for trimmed match
                 if (std.ascii.eqlIgnoreCase(trimmed, module_name)) {
                     potential_trimmed_match = module;
                 }
             }
         }
-
+        
         return potential_trimmed_match;
     }
 };

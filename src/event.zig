@@ -23,7 +23,7 @@ extern "kernel32" fn GetFinalPathNameByHandleW(
     dwFlags: DWORD,
 ) callconv(WINAPI) DWORD;
 
-// Debug event constants
+// Debug event constants  
 const EXCEPTION_DEBUG_EVENT: DWORD = 1;
 const CREATE_THREAD_DEBUG_EVENT: DWORD = 2;
 const CREATE_PROCESS_DEBUG_EVENT: DWORD = 3;
@@ -132,7 +132,7 @@ pub const DebugEvent = union(enum) {
     OutputDebugString: []const u8,
     ExitProcess,
     Other: []const u8,
-
+    
     pub fn deinit(self: DebugEvent, allocator: std.mem.Allocator) void {
         switch (self) {
             .CreateProcess => |cp| {
@@ -166,7 +166,7 @@ fn extractFilename(allocator: std.mem.Allocator, full_path: []const u16) ?[]u8 {
     // Convert UTF-16 to UTF-8 first
     const utf8_path = std.unicode.utf16LeToUtf8Alloc(allocator, full_path) catch return null;
     defer allocator.free(utf8_path);
-
+    
     // Find the last backslash or forward slash
     var last_sep: ?usize = null;
     for (utf8_path, 0..) |c, i| {
@@ -174,9 +174,9 @@ fn extractFilename(allocator: std.mem.Allocator, full_path: []const u16) ?[]u8 {
             last_sep = i;
         }
     }
-
-    const filename = if (last_sep) |sep| utf8_path[sep + 1 ..] else utf8_path;
-
+    
+    const filename = if (last_sep) |sep| utf8_path[sep + 1..] else utf8_path;
+    
     // Allocate and copy the filename
     const result = allocator.alloc(u8, filename.len) catch return null;
     @memcpy(result, filename);
@@ -196,34 +196,37 @@ fn readMemoryString(mem_source: memory.MemorySource, allocator: std.mem.Allocato
 // TODO: Add MemorySource parameter when integrating with main debugger loop
 pub fn waitForNextDebugEvent(allocator: std.mem.Allocator, mem_source: ?memory.MemorySource) !struct { EventContext, DebugEvent } {
     var debug_event = std.mem.zeroes(DEBUG_EVENT);
-
+    
     const result = WaitForDebugEventEx(&debug_event, INFINITE);
     if (result == 0) {
         return error.WaitForDebugEventFailed;
     }
-
+    
     const ctx = EventContext{
         .process_id = debug_event.dwProcessId,
         .thread_id = debug_event.dwThreadId,
     };
-
+    
     const event = switch (debug_event.dwDebugEventCode) {
         EXCEPTION_DEBUG_EVENT => blk: {
             const code = debug_event.u.Exception.ExceptionRecord.ExceptionCode;
             const first_chance = debug_event.u.Exception.dwFirstChance != 0;
-            break :blk DebugEvent{ .Exception = .{ .first_chance = first_chance, .exception_code = @bitCast(code) } };
+            break :blk DebugEvent{ .Exception = .{ 
+                .first_chance = first_chance, 
+                .exception_code = @bitCast(code)
+            }};
         },
         CREATE_THREAD_DEBUG_EVENT => blk: {
             const create_thread = debug_event.u.CreateThread;
             const thread_id = GetThreadId(create_thread.hThread);
             _ = CloseHandle(create_thread.hThread);
-            break :blk DebugEvent{ .CreateThread = .{ .thread_id = thread_id } };
+            break :blk DebugEvent{ .CreateThread = .{ .thread_id = thread_id }};
         },
-        EXIT_THREAD_DEBUG_EVENT => DebugEvent{ .ExitThread = .{ .thread_id = debug_event.dwThreadId } },
+        EXIT_THREAD_DEBUG_EVENT => DebugEvent{ .ExitThread = .{ .thread_id = debug_event.dwThreadId }},
         CREATE_PROCESS_DEBUG_EVENT => blk: {
             const create_process = debug_event.u.CreateProcessInfo;
             const exe_base = @intFromPtr(create_process.lpBaseOfImage);
-
+            
             var exe_name: ?[]u8 = null;
             if (create_process.hFile != windows.INVALID_HANDLE_VALUE) {
                 var name_buffer: [260]u16 = undefined;
@@ -232,20 +235,20 @@ pub fn waitForNextDebugEvent(allocator: std.mem.Allocator, mem_source: ?memory.M
                     exe_name = extractFilename(allocator, name_buffer[0..name_len]);
                 }
             }
-
-            break :blk DebugEvent{ .CreateProcess = .{ .exe_name = exe_name, .exe_base = exe_base } };
+            
+            break :blk DebugEvent{ .CreateProcess = .{ .exe_name = exe_name, .exe_base = exe_base }};
         },
         EXIT_PROCESS_DEBUG_EVENT => DebugEvent.ExitProcess,
         LOAD_DLL_DEBUG_EVENT => blk: {
             const load_dll = debug_event.u.LoadDll;
             const module_base = @intFromPtr(load_dll.lpBaseOfDll);
-
+            
             const module_name = if (load_dll.lpImageName != null and mem_source != null) blk2: {
                 const is_wide = load_dll.fUnicode != 0;
                 break :blk2 readMemoryStringIndirect(mem_source.?, allocator, @intFromPtr(load_dll.lpImageName), 260, is_wide);
             } else null;
-
-            break :blk DebugEvent{ .LoadModule = .{ .module_name = module_name, .module_base = module_base } };
+            
+            break :blk DebugEvent{ .LoadModule = .{ .module_name = module_name, .module_base = module_base }};
         },
         UNLOAD_DLL_DEBUG_EVENT => blk: {
             const msg = allocator.dupe(u8, "UnloadDll") catch "UnloadDll";
@@ -256,9 +259,9 @@ pub fn waitForNextDebugEvent(allocator: std.mem.Allocator, mem_source: ?memory.M
             const is_wide = debug_string_info.fUnicode != 0;
             const address = @intFromPtr(debug_string_info.lpDebugStringData);
             const len = debug_string_info.nDebugStringLength;
-
+            
             const debug_string = if (mem_source != null) readMemoryString(mem_source.?, allocator, address, len, is_wide) else null;
-
+            
             if (debug_string) |ds| {
                 break :blk DebugEvent{ .OutputDebugString = ds };
             } else {
@@ -275,6 +278,6 @@ pub fn waitForNextDebugEvent(allocator: std.mem.Allocator, mem_source: ?memory.M
             break :blk DebugEvent{ .Other = msg };
         },
     };
-
+    
     return .{ ctx, event };
 }
