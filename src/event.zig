@@ -271,7 +271,7 @@ pub fn waitForNextDebugEvent(allocator: std.mem.Allocator, mem_source: ?memory.M
             break :blk DebugEvent{ .Other = msg };
         },
         else => blk: {
-            const msg = std.fmt.allocPrint(allocator, "Unknown debug event: {}", .{debug_event.dwDebugEventCode}) catch "Unknown debug event";
+            const msg = std.fmt.allocPrint(allocator, "Unknown debug event: {any}", .{debug_event.dwDebugEventCode}) catch "Unknown debug event";
             break :blk DebugEvent{ .Other = msg };
         },
     };

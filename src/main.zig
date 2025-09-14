@@ -4,16 +4,16 @@ const print = std.debug.print;
 const windows = std.os.windows;
 const WINAPI = windows.WINAPI;
 
-// TODO: Import modules when they are ported
-// const event = @import("event.zig");
-// const memory = @import("memory.zig");
-// const process = @import("process.zig");
+const event = @import("event.zig");
+const memory = @import("memory.zig");
+const process = @import("process.zig");
+// TODO: Import remaining modules when ported
 // const breakpoint = @import("breakpoint.zig");
 // const command = @import("command.zig");
 // const eval = @import("eval.zig");
 // const registers = @import("registers.zig");
 // const stack = @import("stack.zig");
-// const util = @import("util.zig");
+const util = @import("util.zig");
 
 const TRAP_FLAG: u32 = 1 << 8;
 
@@ -41,6 +41,18 @@ extern "kernel32" fn CreateProcessW(
 ) callconv(WINAPI) BOOL;
 
 extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(WINAPI) BOOL;
+extern "kernel32" fn OpenThread(
+    dwDesiredAccess: DWORD,
+    bInheritHandle: BOOL,
+    dwThreadId: DWORD,
+) callconv(WINAPI) HANDLE;
+extern "kernel32" fn GetThreadContext(hThread: HANDLE, lpContext: *util.CONTEXT) callconv(WINAPI) BOOL;
+extern "kernel32" fn SetThreadContext(hThread: HANDLE, lpContext: *const util.CONTEXT) callconv(WINAPI) BOOL;
+extern "kernel32" fn ContinueDebugEvent(
+    dwProcessId: DWORD,
+    dwThreadId: DWORD,
+    dwContinueStatus: DWORD,
+) callconv(WINAPI) BOOL;
 
 // Windows structures
 const STARTUPINFOEXW = extern struct {
@@ -79,6 +91,17 @@ const PROCESS_INFORMATION = extern struct {
 // Process creation flags
 const DEBUG_ONLY_THIS_PROCESS: DWORD = 0x00000002;
 const CREATE_NEW_CONSOLE: DWORD = 0x00000010;
+
+// Thread access rights
+const THREAD_GET_CONTEXT: DWORD = 0x0008;
+const THREAD_SET_CONTEXT: DWORD = 0x0010;
+
+// Debug continuation status
+const DBG_CONTINUE: DWORD = 0x00010002;
+const DBG_EXCEPTION_NOT_HANDLED: DWORD = 0x80010001;
+
+// Exception codes
+const EXCEPTION_SINGLE_STEP: i32 = @bitCast(@as(u32, 0x80000004));
 
 const FALSE: BOOL = 0;
 
@@ -147,14 +170,139 @@ fn parseCommandLine(allocator: std.mem.Allocator) ![]u16 {
     return result;
 }
 
-// TODO: Implement when other modules are ported
-fn mainDebuggerLoop(process: HANDLE) void {
-    _ = process;
-    print("TODO: Implement debugger loop - waiting for other modules to be ported\n", .{});
+fn loadModuleAtAddress(proc: *process.Process, mem_source: memory.MemorySource, base_address: u64, module_name: ?[]const u8) void {
+    _ = proc.addModule(base_address, module_name, mem_source) catch |err| {
+        print("Failed to add module at 0x{x}: {any}\n", .{ base_address, err });
+        return;
+    };
 
-    // For now, just a placeholder that shows we successfully created the process
-    print("Process created successfully. Debugger loop not yet implemented.\n", .{});
-    print("Need to port: event.zig, memory.zig, process.zig, breakpoint.zig, etc.\n", .{});
+    const name = module_name orelse "unknown";
+    print("LoadDll: {x}   {s}\n", .{ base_address, name });
+}
+
+fn mainDebuggerLoop(process_handle: HANDLE, allocator: std.mem.Allocator) !void {
+    var expect_step_exception = false;
+    const mem_source = memory.makeLiveMemorySource(process_handle, allocator) catch |err| {
+        print("Failed to create memory source: {any}\n", .{err});
+        return;
+    };
+    defer mem_source.deinit(allocator);
+
+    var proc = process.Process.init(allocator);
+    defer proc.deinit();
+
+    // TODO: Add breakpoint manager when breakpoint.zig is ported
+    // var breakpoints = BreakpointManager.init();
+
+    while (true) {
+        const event_result = event.waitForNextDebugEvent(allocator, mem_source) catch |err| {
+            print("Error waiting for debug event: {any}\n", .{err});
+            break;
+        };
+        const event_context = event_result[0];
+        const debug_event = event_result[1];
+        defer debug_event.deinit(allocator);
+
+        // Get thread context
+        const thread_handle = util.AutoClosedHandle.init(OpenThread(
+            THREAD_GET_CONTEXT | THREAD_SET_CONTEXT,
+            FALSE,
+            event_context.thread_id,
+        ));
+        defer {
+            var handle = thread_handle;
+            handle.deinit();
+        }
+
+        if (thread_handle.get() == windows.INVALID_HANDLE_VALUE) {
+            print("Failed to open thread {any}\n", .{event_context.thread_id});
+            continue;
+        }
+
+        var ctx = util.AlignedContext{ .context = std.mem.zeroes(util.CONTEXT) };
+        ctx.context.ContextFlags = util.CONTEXT_ALL;
+        const get_ctx_result = GetThreadContext(thread_handle.get(), &ctx.context);
+        if (get_ctx_result == 0) {
+            print("GetThreadContext failed\n", .{});
+            continue;
+        }
+
+        var continue_status = DBG_CONTINUE;
+        var is_exit = false;
+
+        switch (debug_event) {
+            .Exception => |exc| {
+                const chance_string = if (exc.first_chance) "first chance" else "second chance";
+
+                if (expect_step_exception and exc.exception_code == EXCEPTION_SINGLE_STEP) {
+                    expect_step_exception = false;
+                    continue_status = DBG_CONTINUE;
+                } else {
+                    // TODO: Add breakpoint checking when breakpoint.zig is ported
+                    // } else if (breakpoints.wasBreakpointHit(&ctx.context)) |bp_index| {
+                    //     print("Breakpoint {} hit\n", .{bp_index});
+                    //     continue_status = DBG_CONTINUE;
+                    print("Exception code {x} ({s})\n", .{ @as(u32, @bitCast(exc.exception_code)), chance_string });
+                    continue_status = DBG_EXCEPTION_NOT_HANDLED;
+                }
+            },
+            .CreateProcess => |cp| {
+                loadModuleAtAddress(&proc, mem_source, cp.exe_base, cp.exe_name);
+                proc.addThread(event_context.thread_id) catch {};
+            },
+            .CreateThread => |ct| {
+                proc.addThread(ct.thread_id) catch {};
+                print("Thread created: {x}\n", .{ct.thread_id});
+            },
+            .ExitThread => |et| {
+                proc.removeThread(et.thread_id);
+                print("Thread exited: {x}\n", .{et.thread_id});
+            },
+            .LoadModule => |lm| {
+                loadModuleAtAddress(&proc, mem_source, lm.module_base, lm.module_name);
+            },
+            .OutputDebugString => |debug_string| {
+                print("DebugOut: {s}\n", .{debug_string});
+            },
+            .Other => |msg| {
+                print("{s}\n", .{msg});
+            },
+            .ExitProcess => {
+                is_exit = true;
+                print("ExitProcess\n", .{});
+            },
+        }
+
+        // For now, automatically continue execution
+        // TODO: Add command processing when command.zig is ported
+        var continue_execution = true;
+
+        while (!continue_execution) {
+            // TODO: Add command processing here
+            print("[{x}] 0x{x:0>16}\n", .{ event_context.thread_id, ctx.context.Rip });
+
+            // For now, just continue
+            continue_execution = true;
+        }
+
+        if (is_exit) {
+            break;
+        }
+
+        // TODO: Apply breakpoints when breakpoint.zig is ported
+        // breakpoints.applyBreakpoints(&proc, event_context.thread_id, mem_source);
+
+        const continue_result = ContinueDebugEvent(
+            event_context.process_id,
+            event_context.thread_id,
+            continue_status,
+        );
+
+        if (continue_result == 0) {
+            print("ContinueDebugEvent failed\n", .{});
+            break;
+        }
+    }
 }
 
 pub fn main() !void {
@@ -203,7 +351,7 @@ pub fn main() !void {
     );
 
     if (success == 0) {
-        print("CreateProcessW failed with error: {}\n", .{windows.kernel32.GetLastError()});
+        print("CreateProcessW failed with error: {any}\n", .{windows.kernel32.GetLastError()});
         return;
     }
 
@@ -211,7 +359,9 @@ pub fn main() !void {
     _ = CloseHandle(pi.hThread);
 
     // Enter debugger loop
-    mainDebuggerLoop(pi.hProcess);
+    mainDebuggerLoop(pi.hProcess, allocator) catch |err| {
+        print("Debugger loop failed: {any}\n", .{err});
+    };
 
     // Clean up process handle
     _ = CloseHandle(pi.hProcess);

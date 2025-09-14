@@ -23,7 +23,7 @@ pub const Module = struct {
             const owned_name = try allocator.dupe(u8, n);
             break :blk owned_name;
         } else blk: {
-            const default_name = try std.fmt.allocPrint(allocator, "module_{X}", .{address});
+            const default_name = try std.fmt.allocPrint(allocator, "module_{x}", .{address});
             break :blk default_name;
         };
 

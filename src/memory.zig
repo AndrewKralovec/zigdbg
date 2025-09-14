@@ -171,7 +171,7 @@ const LiveMemorySource = struct {
         var data = try allocator.alloc(?u8, len);
         @memset(data, null);
 
-        var buffer = try allocator.alloc(u8, len);
+        const buffer = try allocator.alloc(u8, len);
         defer allocator.free(buffer);
 
         var offset: usize = 0;
@@ -212,7 +212,7 @@ const LiveMemorySource = struct {
     }
 
     pub fn readRawMemory(self: *LiveMemorySource, address: u64, len: usize, allocator: std.mem.Allocator) ![]u8 {
-        var buffer = try allocator.alloc(u8, len);
+        const buffer = try allocator.alloc(u8, len);
         var bytes_read: SIZE_T = 0;
 
         const result = ReadProcessMemory(
