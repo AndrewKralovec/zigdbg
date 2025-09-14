@@ -43,6 +43,17 @@ const CONTEXT_ALL = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTE
 // Trap flag for single stepping
 const TRAP_FLAG = 1 << 8;
 
+// Resume flag for hardware breakpoints
+const EFLAG_RF = 16; // Bit position for Resume Flag in EFlags
+
+// Debug register constants
+const DR6_B_BIT = [4]usize{ 0, 1, 2, 3 }; // B0-B3 bits in DR6
+const DR7_LE_BIT = [4]usize{ 0, 2, 4, 6 }; // Local Enable bits in DR7
+const DR7_LEN_BIT = [4]usize{ 18, 22, 26, 30 }; // Length bits in DR7
+const DR7_LEN_SIZE = 2;
+const DR7_RW_BIT = [4]usize{ 16, 20, 24, 28 }; // Read/Write bits in DR7
+const DR7_RW_SIZE = 2;
+
 // Maximum path length for module names
 const MAX_PATH = 260;
 
@@ -157,12 +168,10 @@ const IMAGE_DEBUG_DIRECTORY = extern struct {
 
 const PDB_INFO = extern struct {
     signature: u32,
-    guid: [16]u8, // GUID as bytes
+    guid: [16]u8,
     age: u32,
-    // Null terminated name goes after the end
 };
 
-// Debug event structures (keeping existing ones)
 const DEBUG_EVENT = extern struct {
     dwDebugEventCode: windows.DWORD,
     dwProcessId: windows.DWORD,
@@ -310,6 +319,153 @@ const AutoClosedHandle = struct {
     }
 };
 
+// Breakpoint structure
+const Breakpoint = struct {
+    addr: u64,
+    id: u32,
+
+    const Self = @This();
+};
+
+// Breakpoint manager
+const BreakpointManager = struct {
+    breakpoints: ArrayList(Breakpoint),
+    next_id: u32,
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator) Self {
+        return Self{
+            .breakpoints = ArrayList(Breakpoint).init(allocator),
+            .next_id = 0,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.breakpoints.deinit();
+    }
+
+    pub fn addBreakpoint(self: *Self, addr: u64) !void {
+        // Check if we already have 4 breakpoints (hardware limit)
+        if (self.breakpoints.items.len >= 4) {
+            print("Maximum of 4 hardware breakpoints supported\n", .{});
+            return;
+        }
+
+        const breakpoint = Breakpoint{
+            .addr = addr,
+            .id = self.next_id,
+        };
+
+        try self.breakpoints.append(breakpoint);
+        self.next_id += 1;
+
+        // Sort by ID
+        std.mem.sort(Breakpoint, self.breakpoints.items, {}, struct {
+            fn lessThan(_: void, lhs: Breakpoint, rhs: Breakpoint) bool {
+                return lhs.id < rhs.id;
+            }
+        }.lessThan);
+
+        print("Breakpoint {} set at 0x{X}\n", .{ breakpoint.id, addr });
+    }
+
+    pub fn listBreakpoints(self: *const Self, allocator: Allocator, process_info: *Process) void {
+        if (self.breakpoints.items.len == 0) {
+            print("No breakpoints set\n", .{});
+            return;
+        }
+
+        for (self.breakpoints.items) |bp| {
+            if (resolveAddressToName(allocator, bp.addr, process_info)) |sym| {
+                if (sym) |s| {
+                    print("{:3} 0x{X:0>16} ({s})\n", .{ bp.id, bp.addr, s });
+                    allocator.free(s);
+                } else {
+                    print("{:3} 0x{X:0>16}\n", .{ bp.id, bp.addr });
+                }
+            } else |_| {
+                print("{:3} 0x{X:0>16}\n", .{ bp.id, bp.addr });
+            }
+        }
+    }
+
+    pub fn clearBreakpoint(self: *Self, id: u32) void {
+        var i: usize = 0;
+        while (i < self.breakpoints.items.len) {
+            if (self.breakpoints.items[i].id == id) {
+                _ = self.breakpoints.orderedRemove(i);
+                print("Breakpoint {} cleared\n", .{id});
+                return;
+            }
+            i += 1;
+        }
+        print("Breakpoint {} not found\n", .{id});
+    }
+
+    pub fn wasBreakpointHit(self: *const Self, context: windows.CONTEXT) ?u32 {
+        for (self.breakpoints.items, 0..) |_, idx| {
+            if (getBit(context.Dr6, DR6_B_BIT[idx])) {
+                return self.breakpoints.items[idx].id;
+            }
+        }
+        return null;
+    }
+
+    pub fn applyBreakpoints(self: *Self, process_info: *Process, resume_thread_id: u32) void {
+        // Apply breakpoints to all threads
+        for (process_info.thread_ids.items) |thread_id| {
+            var thread = AutoClosedHandle.init(OpenThread(
+                THREAD_GET_CONTEXT | THREAD_SET_CONTEXT,
+                FALSE,
+                thread_id,
+            ));
+            defer thread.deinit();
+
+            if (thread.getHandle() == windows.INVALID_HANDLE_VALUE) {
+                continue;
+            }
+
+            var ctx = AlignedContext.init();
+            ctx.context.ContextFlags = CONTEXT_ALL;
+
+            const get_result = GetThreadContext(thread.getHandle(), &ctx.context);
+            if (get_result == 0) {
+                continue;
+            }
+
+            // Set resume flag for the thread that caused the break
+            if (thread_id == resume_thread_id) {
+                setBits(&ctx.context.EFlags, 1, EFLAG_RF, 1);
+            }
+
+            // Apply breakpoints to debug registers
+            for (0..4) |idx| {
+                if (self.breakpoints.items.len > idx) {
+                    // Set LEN to 0 (1 byte), RW to 0 (execute), LE to 1 (enabled)
+                    setBits(&ctx.context.Dr7, 0, DR7_LEN_BIT[idx], DR7_LEN_SIZE);
+                    setBits(&ctx.context.Dr7, 0, DR7_RW_BIT[idx], DR7_RW_SIZE);
+                    setBits(&ctx.context.Dr7, 1, DR7_LE_BIT[idx], 1);
+
+                    // Set the breakpoint address
+                    switch (idx) {
+                        0 => ctx.context.Dr0 = self.breakpoints.items[idx].addr,
+                        1 => ctx.context.Dr1 = self.breakpoints.items[idx].addr,
+                        2 => ctx.context.Dr2 = self.breakpoints.items[idx].addr,
+                        3 => ctx.context.Dr3 = self.breakpoints.items[idx].addr,
+                        else => {},
+                    }
+                } else {
+                    // Disable unused breakpoints
+                    setBits(&ctx.context.Dr7, 0, DR7_LE_BIT[idx], 1);
+                }
+            }
+
+            _ = SetThreadContext(thread.getHandle(), &ctx.context);
+        }
+    }
+};
+
 // Export target enumeration
 const ExportTarget = union(enum) {
     RVA: u64,
@@ -387,7 +543,6 @@ const Module = struct {
         };
 
         if (pe_header.Signature != IMAGE_NT_SIGNATURE) {
-            print("Invalid PE signature\n", .{});
             return error.InvalidPeSignature;
         }
 
@@ -395,7 +550,8 @@ const Module = struct {
 
         // Set module name
         if (name) |n| {
-            module.name = try allocator.dupe(u8, n);
+            const filename = extractFilename(n);
+            module.name = try allocator.dupe(u8, filename);
         } else {
             module.name = try allocator.dupe(u8, "unknown");
         }
@@ -424,6 +580,20 @@ const Module = struct {
         return address >= self.base_address and address < (self.base_address + self.size);
     }
 
+    pub fn findExportByName(self: *const Self, name: []const u8) ?u64 {
+        for (self.exports.items) |*exp| {
+            if (exp.name) |exp_name| {
+                if (std.mem.eql(u8, exp_name, name)) {
+                    switch (exp.target) {
+                        .RVA => |addr| return addr,
+                        .Forwarder => {}, // Skip forwarders for now
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
     fn readExports(self: *Self, allocator: Allocator, pe_header: IMAGE_NT_HEADERS64, process: windows.HANDLE) !void {
         const export_table_info = pe_header.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
         if (export_table_info.VirtualAddress == 0) {
@@ -442,7 +612,6 @@ const Module = struct {
         if (std.mem.eql(u8, self.name, "unknown") and export_directory.Name != 0) {
             const name_addr = self.base_address + export_directory.Name;
             const new_name = readProcessMemoryString(allocator, process, name_addr, 512, false) catch {
-                // Keep the old name if we can't read the new one
                 return;
             };
             allocator.free(self.name);
@@ -531,7 +700,6 @@ const Module = struct {
 
             if (debug_directory.Type == IMAGE_DEBUG_TYPE_CODEVIEW) {
                 const pdb_info_address = self.base_address + debug_directory.AddressOfRawData;
-                // const pdb_info = readProcessMemoryData(PDB_INFO, process, pdb_info_address) catch |err| {
                 _ = readProcessMemoryData(PDB_INFO, process, pdb_info_address) catch |err| {
                     print("Failed to read PDB info: {any}\n", .{err});
                     continue;
@@ -544,22 +712,23 @@ const Module = struct {
                     continue;
                 };
 
-                // We found the CodeView entry, so we're done
                 break;
             }
         }
     }
 };
 
-// Process structure to track modules
+// Process structure to track modules and threads
 const Process = struct {
     modules: ArrayList(Module),
+    thread_ids: ArrayList(u32),
 
     const Self = @This();
 
     pub fn init(allocator: Allocator) Self {
         return Self{
             .modules = ArrayList(Module).init(allocator),
+            .thread_ids = ArrayList(u32).init(allocator),
         };
     }
 
@@ -568,6 +737,7 @@ const Process = struct {
             module.deinit(allocator);
         }
         self.modules.deinit();
+        self.thread_ids.deinit();
     }
 
     pub fn addModule(self: *Self, allocator: Allocator, address: u64, name: ?[]const u8, process: windows.HANDLE) !*Module {
@@ -580,9 +750,34 @@ const Process = struct {
         return &self.modules.items[self.modules.items.len - 1];
     }
 
+    pub fn addThread(self: *Self, thread_id: u32) !void {
+        try self.thread_ids.append(thread_id);
+    }
+
+    pub fn removeThread(self: *Self, thread_id: u32) void {
+        var i: usize = 0;
+        while (i < self.thread_ids.items.len) {
+            if (self.thread_ids.items[i] == thread_id) {
+                _ = self.thread_ids.orderedRemove(i);
+                return;
+            }
+            i += 1;
+        }
+    }
+
     pub fn getContainingModule(self: *Self, address: u64) ?*Module {
         for (self.modules.items) |*module| {
             if (module.containsAddress(address)) {
+                return module;
+            }
+        }
+        return null;
+    }
+
+    pub fn getModuleByName(self: *Self, name: []const u8) ?*Module {
+        const filename = extractFilename(name);
+        for (self.modules.items) |*module| {
+            if (std.mem.eql(u8, module.name, filename)) {
                 return module;
             }
         }
@@ -593,6 +788,7 @@ const Process = struct {
 // Expression types for evaluation
 const EvalExpr = union(enum) {
     Number: u64,
+    Symbol: []u8,
     Add: struct {
         left: *EvalExpr,
         right: *EvalExpr,
@@ -603,6 +799,7 @@ const EvalExpr = union(enum) {
     pub fn deinit(self: *Self, allocator: Allocator) void {
         switch (self.*) {
             .Number => {},
+            .Symbol => |sym| allocator.free(sym),
             .Add => |add| {
                 add.left.deinit(allocator);
                 add.right.deinit(allocator);
@@ -612,10 +809,11 @@ const EvalExpr = union(enum) {
         }
     }
 
-    pub fn evaluate(self: *const Self) u64 {
+    pub fn evaluate(self: *const Self, allocator: Allocator, process_info: *Process) !u64 {
         return switch (self.*) {
             .Number => |n| n,
-            .Add => |add| add.left.evaluate() + add.right.evaluate(),
+            .Symbol => |sym| try resolveNameToAddress(sym, process_info),
+            .Add => |add| (try add.left.evaluate(allocator, process_info)) + (try add.right.evaluate(allocator, process_info)),
         };
     }
 };
@@ -625,12 +823,27 @@ const Command = union(enum) {
     StepInto,
     Go,
     DisplayRegisters,
-    DisplayBytes: u64, // address to display
-    Evaluate: u64, // expression to evaluate
-    ListNearest: u64, // address to lookup nearest symbol
+    DisplayBytes: u64,
+    Evaluate: u64,
+    ListNearest: u64,
+    SetBreakpoint: u64,
+    ListBreakpoints,
+    ClearBreakpoint: u32,
     Quit,
     Unknown,
 };
+
+// Bit manipulation helper functions
+fn setBits(val: anytype, set_val: @TypeOf(val.*), start_bit: usize, bit_count: usize) void {
+    const T = @TypeOf(val.*);
+    const mask: T = (@as(T, 1) << @intCast(bit_count)) - 1;
+    const shifted_mask = mask << @intCast(start_bit);
+    val.* = (val.* & ~shifted_mask) | ((set_val & mask) << @intCast(start_bit));
+}
+
+fn getBit(val: u64, bit_pos: usize) bool {
+    return (val & (@as(u64, 1) << @intCast(bit_pos))) != 0;
+}
 
 // External Windows API functions
 extern "kernel32" fn GetCommandLineW() callconv(windows.WINAPI) [*:0]u16;
@@ -759,7 +972,7 @@ fn parseInt(text: []const u8) !u64 {
     }
 }
 
-// Simple expression parser (replacing rust-sitter)
+// Simple expression parser
 fn parseExpression(allocator: Allocator, text: []const u8) !EvalExpr {
     const trimmed = std.mem.trim(u8, text, " \t");
 
@@ -781,6 +994,11 @@ fn parseExpression(allocator: Allocator, text: []const u8) !EvalExpr {
         i += 1;
     }
 
+    // Check if it's a symbol (contains '!' or looks like an identifier)
+    if (std.mem.indexOf(u8, trimmed, "!") != null or !std.ascii.isDigit(trimmed[0])) {
+        return EvalExpr{ .Symbol = try allocator.dupe(u8, trimmed) };
+    }
+
     // No addition operator found, parse as number
     const num = parseInt(trimmed) catch |err| {
         print("Failed to parse number: {s}\n", .{trimmed});
@@ -790,8 +1008,30 @@ fn parseExpression(allocator: Allocator, text: []const u8) !EvalExpr {
     return EvalExpr{ .Number = num };
 }
 
-// Extended command parsing with expressions
-fn readCommand(allocator: Allocator) !Command {
+// Resolve symbol name to address
+fn resolveNameToAddress(sym: []const u8, process: *Process) !u64 {
+    if (std.mem.indexOf(u8, sym, "!")) |pos| {
+        // Fully qualified name: module!function
+        const module_name = sym[0..pos];
+        const func_name = sym[pos + 1 ..];
+
+        if (process.getModuleByName(module_name)) |module| {
+            if (module.findExportByName(func_name)) |addr| {
+                return addr;
+            } else {
+                return error.FunctionNotFound;
+            }
+        } else {
+            return error.ModuleNotFound;
+        }
+    } else {
+        // Search all modules (not implemented for now)
+        return error.NotImplemented;
+    }
+}
+
+// Extended command parsing with expressions and breakpoints
+fn readCommand(allocator: Allocator, process_info: *Process) !Command {
     const stdin = std.io.getStdIn().reader();
 
     while (true) {
@@ -812,6 +1052,32 @@ fn readCommand(allocator: Allocator) !Command {
                     return Command.DisplayRegisters;
                 } else if (std.mem.eql(u8, trimmed, "q")) {
                     return Command.Quit;
+                } else if (std.mem.eql(u8, trimmed, "bl")) {
+                    return Command.ListBreakpoints;
+                } else if (std.mem.startsWith(u8, trimmed, "bp ")) {
+                    const expr_text = trimmed[3..];
+                    var expr = parseExpression(allocator, expr_text) catch {
+                        print("Invalid expression in bp command\n", .{});
+                        continue;
+                    };
+                    defer expr.deinit(allocator);
+                    const addr = expr.evaluate(allocator, process_info) catch |err| {
+                        print("Failed to evaluate breakpoint address: {any}\n", .{err});
+                        continue;
+                    };
+                    return Command{ .SetBreakpoint = addr };
+                } else if (std.mem.startsWith(u8, trimmed, "bc ")) {
+                    const expr_text = trimmed[3..];
+                    var expr = parseExpression(allocator, expr_text) catch {
+                        print("Invalid expression in bc command\n", .{});
+                        continue;
+                    };
+                    defer expr.deinit(allocator);
+                    const id = expr.evaluate(allocator, process_info) catch |err| {
+                        print("Failed to evaluate breakpoint ID: {any}\n", .{err});
+                        continue;
+                    };
+                    return Command{ .ClearBreakpoint = @intCast(id) };
                 } else if (std.mem.startsWith(u8, trimmed, "db ")) {
                     const expr_text = trimmed[3..];
                     var expr = parseExpression(allocator, expr_text) catch {
@@ -819,7 +1085,10 @@ fn readCommand(allocator: Allocator) !Command {
                         continue;
                     };
                     defer expr.deinit(allocator);
-                    const addr = expr.evaluate();
+                    const addr = expr.evaluate(allocator, process_info) catch |err| {
+                        print("Failed to evaluate address: {any}\n", .{err});
+                        continue;
+                    };
                     return Command{ .DisplayBytes = addr };
                 } else if (std.mem.startsWith(u8, trimmed, "ln ")) {
                     const expr_text = trimmed[3..];
@@ -828,7 +1097,10 @@ fn readCommand(allocator: Allocator) !Command {
                         continue;
                     };
                     defer expr.deinit(allocator);
-                    const addr = expr.evaluate();
+                    const addr = expr.evaluate(allocator, process_info) catch |err| {
+                        print("Failed to evaluate address: {any}\n", .{err});
+                        continue;
+                    };
                     return Command{ .ListNearest = addr };
                 } else if (std.mem.startsWith(u8, trimmed, "? ")) {
                     const expr_text = trimmed[2..];
@@ -837,7 +1109,10 @@ fn readCommand(allocator: Allocator) !Command {
                         continue;
                     };
                     defer expr.deinit(allocator);
-                    const value = expr.evaluate();
+                    const value = expr.evaluate(allocator, process_info) catch |err| {
+                        print("Failed to evaluate expression: {any}\n", .{err});
+                        continue;
+                    };
                     return Command{ .Evaluate = value };
                 } else {
                     print("Unknown command: {s}\n", .{trimmed});
@@ -848,6 +1123,9 @@ fn readCommand(allocator: Allocator) !Command {
                     print("  db <addr> - display bytes at address\n", .{});
                     print("  ln <addr> - list nearest symbol to address\n", .{});
                     print("  ? <expr> - evaluate expression\n", .{});
+                    print("  bp <addr> - set breakpoint at address\n", .{});
+                    print("  bl - list breakpoints\n", .{});
+                    print("  bc <id> - clear breakpoint by ID\n", .{});
                     print("  q - quit\n", .{});
                     continue;
                 }
@@ -1017,10 +1295,23 @@ fn displayBytes(process: windows.HANDLE, address: u64) void {
     print("\n", .{});
 }
 
+/// Extracts the filename from a full path string.
+/// If a backslash is found, returns the substring after the last backslash.
+/// Otherwise, returns the original string (assumed to be just the filename).
+fn extractFilename(path: []const u8) []const u8 {
+    if (std.mem.lastIndexOf(u8, path, "\\")) |idx| {
+        return path[idx + 1 ..];
+    }
+    return path;
+}
+
 fn mainDebuggerLoop(allocator: Allocator, process: windows.HANDLE) !void {
     var expect_step_exception = false;
     var process_info = Process.init(allocator);
     defer process_info.deinit(allocator);
+
+    var breakpoints = BreakpointManager.init(allocator);
+    defer breakpoints.deinit();
 
     while (true) {
         var debug_event = std.mem.zeroes(DEBUG_EVENT);
@@ -1043,11 +1334,14 @@ fn mainDebuggerLoop(allocator: Allocator, process: windows.HANDLE) !void {
                     expect_step_exception = false;
                     continue_status = DBG_CONTINUE;
                 } else {
-                    print("Exception code {x} ({s})\n", .{ code, chance_string });
+                    print("Exception code 0x{x:0>4} ({s})\n", .{ code, chance_string });
                     continue_status = DBG_EXCEPTION_NOT_HANDLED;
                 }
             },
-            CREATE_THREAD_DEBUG_EVENT => print("CreateThread\n", .{}),
+            CREATE_THREAD_DEBUG_EVENT => {
+                print("CreateThread\n", .{});
+                _ = process_info.addThread(debug_event.dwThreadId) catch {};
+            },
             CREATE_PROCESS_DEBUG_EVENT => {
                 const create_process = debug_event.u.CreateProcessInfo;
                 const dll_base = @intFromPtr(create_process.lpBaseOfImage);
@@ -1069,13 +1363,18 @@ fn mainDebuggerLoop(allocator: Allocator, process: windows.HANDLE) !void {
                     print("Failed to add process module: {any}\n", .{err});
                 };
 
+                _ = process_info.addThread(debug_event.dwThreadId) catch {};
+
                 if (process_name) |name| {
-                    print("CreateProcess\nLoadDll: {x} {s}\n", .{ dll_base, name });
+                    print("CreateProcess\nLoadDll: 0x{x:0>16} {s}\n", .{ dll_base, name });
                 } else {
-                    print("CreateProcess\nLoadDll: {x}\n", .{dll_base});
+                    print("CreateProcess\nLoadDll: 0x{x:0>16}\n", .{dll_base});
                 }
             },
-            EXIT_THREAD_DEBUG_EVENT => print("ExitThread\n", .{}),
+            EXIT_THREAD_DEBUG_EVENT => {
+                print("ExitThread\n", .{});
+                process_info.removeThread(debug_event.dwThreadId);
+            },
             EXIT_PROCESS_DEBUG_EVENT => print("ExitProcess\n", .{}),
             LOAD_DLL_DEBUG_EVENT => {
                 const load_dll = debug_event.u.LoadDll;
@@ -1099,9 +1398,9 @@ fn mainDebuggerLoop(allocator: Allocator, process: windows.HANDLE) !void {
                 };
 
                 if (dll_name) |name| {
-                    print("LoadDll: {x} {s}\n", .{ dll_base, name });
+                    print("LoadDll: 0x{x:0>16} {s}\n", .{ dll_base, name });
                 } else {
-                    print("LoadDll: {x}\n", .{dll_base});
+                    print("LoadDll: 0x{x:0>16}\n", .{dll_base});
                 }
             },
             UNLOAD_DLL_DEBUG_EVENT => print("UnloadDll\n", .{}),
@@ -1149,20 +1448,33 @@ fn mainDebuggerLoop(allocator: Allocator, process: windows.HANDLE) !void {
             continue;
         }
 
+        // Check if a breakpoint was hit
+        if (debug_event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
+            const code = debug_event.u.Exception.ExceptionRecord.ExceptionCode;
+            if (code == EXCEPTION_SINGLE_STEP) {
+                if (breakpoints.wasBreakpointHit(ctx.context)) |bp_id| {
+                    print("Breakpoint {} hit\n", .{bp_id});
+                    continue_status = DBG_CONTINUE;
+                }
+            }
+        }
+
         var continue_execution = false;
 
         while (!continue_execution) {
             // Try to resolve the instruction pointer to a symbol
-            if (resolveAddressToName(allocator, ctx.context.Rip, &process_info)) |opSym| {
-                if (opSym) |sym| {
-                    print("[{x}] {s}\n", .{ debug_event.dwThreadId, sym });
-                    allocator.free(sym);
+            if (resolveAddressToName(allocator, ctx.context.Rip, &process_info)) |sym| {
+                if (sym) |s| {
+                    print("[0x{x:0>4}] {s}\n", .{ debug_event.dwThreadId, s });
+                    allocator.free(s);
+                } else {
+                    print("[0x{x:0>4}]\n", .{debug_event.dwThreadId});
                 }
             } else |_| {
-                print("[{x}] 0x{x:0>16}\n", .{ debug_event.dwThreadId, ctx.context.Rip });
+                print("[0x{x:0>4}] 0x{x:0>16}\n", .{ debug_event.dwThreadId, ctx.context.Rip });
             }
 
-            const cmd = readCommand(allocator) catch |err| {
+            const cmd = readCommand(allocator, &process_info) catch |err| {
                 print("Command parsing error: {any}\n", .{err});
                 continue;
             };
@@ -1188,10 +1500,12 @@ fn mainDebuggerLoop(allocator: Allocator, process: windows.HANDLE) !void {
                     displayBytes(process, address);
                 },
                 Command.ListNearest => |address| {
-                    if (resolveAddressToName(allocator, address, &process_info)) |opSym| {
-                        if (opSym) |sym| {
-                            print("{s}\n", .{sym});
-                            allocator.free(sym);
+                    if (resolveAddressToName(allocator, address, &process_info)) |sym| {
+                        if (sym) |s| {
+                            print("{s}\n", .{s});
+                            allocator.free(s);
+                        } else {
+                            print("No symbol found\n", .{});
                         }
                     } else |_| {
                         print("No symbol found\n", .{});
@@ -1199,6 +1513,17 @@ fn mainDebuggerLoop(allocator: Allocator, process: windows.HANDLE) !void {
                 },
                 Command.Evaluate => |value| {
                     print(" = 0x{x}\n", .{value});
+                },
+                Command.SetBreakpoint => |address| {
+                    breakpoints.addBreakpoint(address) catch |err| {
+                        print("Failed to add breakpoint: {any}\n", .{err});
+                    };
+                },
+                Command.ListBreakpoints => {
+                    breakpoints.listBreakpoints(allocator, &process_info);
+                },
+                Command.ClearBreakpoint => |id| {
+                    breakpoints.clearBreakpoint(id);
                 },
                 Command.Quit => {
                     // The process will be terminated since we didn't detach
@@ -1214,6 +1539,9 @@ fn mainDebuggerLoop(allocator: Allocator, process: windows.HANDLE) !void {
         if (debug_event.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT) {
             break;
         }
+
+        // Apply breakpoints before continuing
+        breakpoints.applyBreakpoints(&process_info, debug_event.dwThreadId);
 
         _ = ContinueDebugEvent(
             debug_event.dwProcessId,
