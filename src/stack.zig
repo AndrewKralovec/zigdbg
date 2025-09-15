@@ -318,7 +318,7 @@ pub fn unwindContext(allocator: Allocator, proc: *process.Process, context: CONT
     const module_opt = proc.getContainingModule(context.Rip);
     if (module_opt) |mod| {
         // Get exception data directory
-        const data_directory = mod.getDataDirectory(IMAGE_DIRECTORY_ENTRY_EXCEPTION) catch return null;
+        const data_directory = mod.getDataDirectory(IMAGE_DIRECTORY_ENTRY_EXCEPTION);
 
         if (data_directory.VirtualAddress != 0 and data_directory.Size != 0) {
             const count = data_directory.Size / @sizeOf(RUNTIME_FUNCTION);
@@ -415,5 +415,4 @@ pub fn walkStack(allocator: Allocator, proc: *process.Process, context: CONTEXT,
             break;
         }
     }
-
 }
