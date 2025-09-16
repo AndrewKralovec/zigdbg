@@ -1,36 +1,46 @@
 const std = @import("std");
-const memory = @import("memory.zig");
 const windows = std.os.windows;
+const print = std.debug.print;
+const ArrayList = std.ArrayList;
+const Allocator = std.mem.Allocator;
 
-// PE header structures
-const IMAGE_DATA_DIRECTORY = packed struct {
-    VirtualAddress: u32,
-    Size: u32,
+const memory = @import("memory.zig");
+const util = @import("util.zig");
+
+// Maximum path length for module names
+const MAX_PATH = 260;
+
+// PE constants
+const IMAGE_DOS_SIGNATURE = 0x5A4D; // MZ
+const IMAGE_NT_SIGNATURE = 0x00004550; // PE00
+const IMAGE_DIRECTORY_ENTRY_EXPORT = 0;
+const IMAGE_DIRECTORY_ENTRY_DEBUG = 6;
+const IMAGE_DEBUG_TYPE_CODEVIEW = 2;
+
+// PE structures
+pub const IMAGE_DOS_HEADER = extern struct {
+    e_magic: u16,
+    e_cblp: u16,
+    e_cp: u16,
+    e_crlc: u16,
+    e_cparhdr: u16,
+    e_minalloc: u16,
+    e_maxalloc: u16,
+    e_ss: u16,
+    e_sp: u16,
+    e_csum: u16,
+    e_ip: u16,
+    e_cs: u16,
+    e_lfarlc: u16,
+    e_ovno: u16,
+    e_res: [4]u16,
+    e_oemid: u16,
+    e_oeminfo: u16,
+    e_res2: [10]u16,
+    e_lfanew: i32,
 };
 
-const IMAGE_DOS_HEADER = extern struct {
-    e_magic: u16, // "MZ" signature
-    e_cblp: u16, // Bytes on last page of file
-    e_cp: u16, // Pages in file
-    e_crlc: u16, // Relocations
-    e_cparhdr: u16, // Size of header in paragraphs
-    e_minalloc: u16, // Minimum extra paragraphs needed
-    e_maxalloc: u16, // Maximum extra paragraphs needed
-    e_ss: u16, // Initial relative SS value
-    e_sp: u16, // Initial SP value
-    e_csum: u16, // Checksum
-    e_ip: u16, // Initial IP value
-    e_cs: u16, // Initial relative CS value
-    e_lfarlc: u16, // File address of relocation table
-    e_ovno: u16, // Overlay number
-    e_res: [4]u16, // Reserved words
-    e_oemid: u16, // OEM identifier
-    e_oeminfo: u16, // OEM information
-    e_res2: [10]u16, // Reserved words
-    e_lfanew: u32, // File address of new exe header
-};
-
-const IMAGE_FILE_HEADER = extern struct {
+pub const IMAGE_FILE_HEADER = extern struct {
     Machine: u16,
     NumberOfSections: u16,
     TimeDateStamp: u32,
@@ -40,7 +50,12 @@ const IMAGE_FILE_HEADER = extern struct {
     Characteristics: u16,
 };
 
-const IMAGE_OPTIONAL_HEADER64 = extern struct {
+pub const IMAGE_DATA_DIRECTORY = extern struct {
+    VirtualAddress: u32,
+    Size: u32,
+};
+
+pub const IMAGE_OPTIONAL_HEADER64 = extern struct {
     Magic: u16,
     MajorLinkerVersion: u8,
     MinorLinkerVersion: u8,
@@ -73,30 +88,13 @@ const IMAGE_OPTIONAL_HEADER64 = extern struct {
     DataDirectory: [16]IMAGE_DATA_DIRECTORY,
 };
 
-const IMAGE_NT_HEADERS64 = extern struct {
-    Signature: u32, // "PE\0\0"
+pub const IMAGE_NT_HEADERS64 = extern struct {
+    Signature: u32,
     FileHeader: IMAGE_FILE_HEADER,
     OptionalHeader: IMAGE_OPTIONAL_HEADER64,
 };
 
-// PE signatures
-const IMAGE_DOS_SIGNATURE: u16 = 0x5A4D; // "MZ"
-const IMAGE_NT_SIGNATURE: u32 = 0x00004550; // "PE\0\0"
-
-// Debug directory structures
-const IMAGE_DEBUG_DIRECTORY = extern struct {
-    Characteristics: u32,
-    TimeDateStamp: u32,
-    MajorVersion: u16,
-    MinorVersion: u16,
-    Type: u32,
-    SizeOfData: u32,
-    AddressOfRawData: u32,
-    PointerToRawData: u32,
-};
-
-// Export directory structure
-const IMAGE_EXPORT_DIRECTORY = extern struct {
+pub const IMAGE_EXPORT_DIRECTORY = extern struct {
     Characteristics: u32,
     TimeDateStamp: u32,
     MajorVersion: u16,
@@ -110,170 +108,251 @@ const IMAGE_EXPORT_DIRECTORY = extern struct {
     AddressOfNameOrdinals: u32,
 };
 
-// Directory entry indices
-const IMAGE_DIRECTORY_ENTRY_EXPORT = 0;
-const IMAGE_DIRECTORY_ENTRY_DEBUG = 6;
+pub const IMAGE_DEBUG_DIRECTORY = extern struct {
+    Characteristics: u32,
+    TimeDateStamp: u32,
+    MajorVersion: u16,
+    MinorVersion: u16,
+    Type: u32,
+    SizeOfData: u32,
+    AddressOfRawData: u32,
+    PointerToRawData: u32,
+};
 
-// Debug directory type constants
-const IMAGE_DEBUG_TYPE_CODEVIEW = 2;
-
-// Machine architecture constants
-const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
-
-// PDB structures
-const PdbInfo = extern struct {
+pub const PDB_INFO = extern struct {
     signature: u32,
-    guid: [16]u8, // GUID as bytes
+    guid: [16]u8,
     age: u32,
 };
 
-// Read PE header from memory
-fn readPeHeader(allocator: std.mem.Allocator, module_address: u64, mem_source: memory.MemorySource) !IMAGE_OPTIONAL_HEADER64 {
-    // Read DOS header
-    const dos_header = memory.readMemoryData(IMAGE_DOS_HEADER, mem_source, module_address, allocator) catch return error.MemoryReadError;
+// PE Section header
+pub const IMAGE_SECTION_HEADER = extern struct {
+    Name: [8]u8,
+    VirtualSize: u32,
+    VirtualAddress: u32,
+    SizeOfRawData: u32,
+    PointerToRawData: u32,
+    PointerToRelocations: u32,
+    PointerToLinenumbers: u32,
+    NumberOfRelocations: u16,
+    NumberOfLinenumbers: u16,
+    Characteristics: u32,
+};
 
-    // Verify DOS signature
-    if (dos_header.e_magic != IMAGE_DOS_SIGNATURE) {
-        return error.InvalidDosSignature;
+// Export target enumeration
+pub const ExportTarget = union(enum) {
+    RVA: u64,
+    Forwarder: []u8,
+
+    const Self = @This();
+
+    pub fn deinit(self: *Self, allocator: Allocator) void {
+        switch (self.*) {
+            .RVA => {},
+            .Forwarder => |name| allocator.free(name),
+        }
+    }
+};
+
+// Export structure
+pub const Export = struct {
+    name: ?[]u8,
+    ordinal: u32,
+    target: ExportTarget,
+
+    const Self = @This();
+
+    pub fn deinit(self: *Self, allocator: Allocator) void {
+        if (self.name) |name| {
+            allocator.free(name);
+        }
+        self.target.deinit(allocator);
     }
 
-    // Calculate PE header address
-    const pe_header_address = module_address + dos_header.e_lfanew;
+    pub fn toString(self: *const Self, allocator: Allocator) ![]u8 {
+        if (self.name) |name| {
+            return try allocator.dupe(u8, name);
+        } else {
+            return try std.fmt.allocPrint(allocator, "#{}", .{self.ordinal});
+        }
+    }
+};
 
-    // Read NT headers
-    const nt_headers = memory.readMemoryData(IMAGE_NT_HEADERS64, mem_source, pe_header_address, allocator) catch return error.MemoryReadError;
+// Module structure
+pub const Module = struct {
+    base_address: u64,
+    size: u32,
+    name: []u8,
+    exports: ArrayList(Export),
+    pdb_name: ?[]u8,
+    sections: ArrayList(IMAGE_SECTION_HEADER),
 
-    // Verify PE signature
-    if (nt_headers.Signature != IMAGE_NT_SIGNATURE) {
-        return error.InvalidPeSignature;
+    const Self = @This();
+
+    pub fn init(allocator: Allocator, base_address: u64, name: ?[]const u8, process: windows.HANDLE) !Self {
+        var module = Self{
+            .base_address = base_address,
+            .size = 0,
+            .name = undefined,
+            .exports = ArrayList(Export).init(allocator),
+            .pdb_name = null,
+            .sections = ArrayList(IMAGE_SECTION_HEADER).init(allocator),
+        };
+
+        // Read DOS header
+        const dos_header = memory.readProcessMemoryData(IMAGE_DOS_HEADER, process, base_address) catch |err| {
+            print("Failed to read DOS header: {any}\n", .{err});
+            return err;
+        };
+
+        if (dos_header.e_magic != IMAGE_DOS_SIGNATURE) {
+            return error.InvalidDosSignature;
+        }
+
+        // Read PE header
+        const pe_header_addr = base_address + @as(u64, @intCast(dos_header.e_lfanew));
+        const pe_header = memory.readProcessMemoryData(IMAGE_NT_HEADERS64, process, pe_header_addr) catch |err| {
+            print("Failed to read PE header: {any}\n", .{err});
+            return err;
+        };
+
+        if (pe_header.Signature != IMAGE_NT_SIGNATURE) {
+            return error.InvalidPeSignature;
+        }
+
+        module.size = pe_header.OptionalHeader.SizeOfImage;
+
+        // Set module name
+        if (name) |n| {
+            const filename = util.extractFilename(n);
+            module.name = try allocator.dupe(u8, filename);
+        } else {
+            module.name = try allocator.dupe(u8, "unknown");
+        }
+
+        // Parse exports
+        try module.readExports(allocator, pe_header, process);
+
+        // Parse debug directory for PDB info
+        try module.readDebugInfo(allocator, pe_header, process);
+
+        // Read section headers
+        try module.readSections(allocator, pe_header, process);
+
+        return module;
     }
 
-    return nt_headers.OptionalHeader;
-}
-
-fn readPeHeaderFull(allocator: std.mem.Allocator, module_address: u64, mem_source: memory.MemorySource) !IMAGE_NT_HEADERS64 {
-    // Read DOS header
-    const dos_header = memory.readMemoryData(IMAGE_DOS_HEADER, mem_source, module_address, allocator) catch return error.MemoryReadError;
-
-    // Verify DOS signature
-    if (dos_header.e_magic != IMAGE_DOS_SIGNATURE) {
-        return error.InvalidDosSignature;
+    pub fn deinit(self: *Self, allocator: Allocator) void {
+        allocator.free(self.name);
+        for (self.exports.items) |*exp| {
+            exp.deinit(allocator);
+        }
+        self.exports.deinit();
+        if (self.pdb_name) |pdb_name| {
+            allocator.free(pdb_name);
+        }
+        self.sections.deinit();
     }
 
-    // Calculate PE header address
-    const pe_header_address = module_address + dos_header.e_lfanew;
-
-    // Read NT headers
-    const nt_headers = memory.readMemoryData(IMAGE_NT_HEADERS64, mem_source, pe_header_address, allocator) catch return error.MemoryReadError;
-
-    // Verify PE signature
-    if (nt_headers.Signature != IMAGE_NT_SIGNATURE) {
-        return error.InvalidPeSignature;
+    pub fn containsAddress(self: *const Self, address: u64) bool {
+        return address >= self.base_address and address < (self.base_address + self.size);
     }
 
-    return nt_headers;
-}
-
-fn readDebugInfo(allocator: std.mem.Allocator, pe_header: IMAGE_NT_HEADERS64, module_address: u64, mem_source: memory.MemorySource) !struct { pdb_info: ?PdbInfo, pdb_name: ?[]const u8 } {
-    var pdb_info: ?PdbInfo = null;
-    var pdb_name: ?[]const u8 = null;
-
-    const debug_table_info = pe_header.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
-    if (debug_table_info.VirtualAddress != 0) {
-        const dir_size = @sizeOf(IMAGE_DEBUG_DIRECTORY);
-        // Limit to 20 entries to keep it sane
-        const count = @min(debug_table_info.Size / dir_size, 20);
-
-        for (0..count) |dir_index| {
-            const debug_directory_address = module_address + debug_table_info.VirtualAddress + (dir_index * dir_size);
-            const debug_directory = memory.readMemoryData(IMAGE_DEBUG_DIRECTORY, mem_source, debug_directory_address, allocator) catch continue;
-
-            if (debug_directory.Type == IMAGE_DEBUG_TYPE_CODEVIEW) {
-                const pdb_info_address = debug_directory.AddressOfRawData + module_address;
-                pdb_info = memory.readMemoryData(PdbInfo, mem_source, pdb_info_address, allocator) catch null;
-
-                if (pdb_info != null) {
-                    // Read PDB name (null-terminated string after PdbInfo struct)
-                    const pdb_name_address = pdb_info_address + @sizeOf(PdbInfo);
-                    const max_size = debug_directory.SizeOfData - @sizeOf(PdbInfo);
-                    pdb_name = memory.readMemoryString(mem_source, pdb_name_address, max_size, false, allocator) catch null;
+    pub fn findExportByName(self: *const Self, name: []const u8) ?u64 {
+        for (self.exports.items) |*exp| {
+            if (exp.name) |exp_name| {
+                if (std.mem.eql(u8, exp_name, name)) {
+                    switch (exp.target) {
+                        .RVA => |addr| return addr,
+                        .Forwarder => {}, // Skip forwarders for now
+                    }
                 }
-                break;
             }
         }
+        return null;
     }
 
-    return .{ .pdb_info = pdb_info, .pdb_name = pdb_name };
-}
-
-fn readExports(allocator: std.mem.Allocator, pe_header: IMAGE_NT_HEADERS64, module_address: u64, mem_source: memory.MemorySource) !struct { exports: []Export, module_name: ?[]const u8 } {
-    var exports = std.ArrayList(Export).init(allocator);
-    defer exports.deinit();
-    var module_name: ?[]const u8 = null;
-
-    const export_table_info = pe_header.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-    if (export_table_info.VirtualAddress != 0) {
-        const export_table_addr = module_address + export_table_info.VirtualAddress;
-        const export_table_end = export_table_addr + export_table_info.Size;
-        const export_directory = memory.readMemoryData(IMAGE_EXPORT_DIRECTORY, mem_source, export_table_addr, allocator) catch {
-            return .{ .exports = try exports.toOwnedSlice(), .module_name = module_name };
-        };
-
-        // Get module name from export directory
-        if (export_directory.Name != 0) {
-            const name_addr = module_address + export_directory.Name;
-            module_name = memory.readMemoryString(mem_source, name_addr, 512, false, allocator) catch null;
+    fn readExports(self: *Self, allocator: Allocator, pe_header: IMAGE_NT_HEADERS64, process: windows.HANDLE) !void {
+        const export_table_info = pe_header.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+        if (export_table_info.VirtualAddress == 0) {
+            return; // No exports
         }
 
-        // Read the name table (parallel arrays of ordinals and name pointers)
-        const ordinal_array_address = module_address + export_directory.AddressOfNameOrdinals;
-        const ordinal_array = memory.readMemoryFullArray(u16, mem_source, ordinal_array_address, export_directory.NumberOfNames, allocator) catch {
-            return .{ .exports = try exports.toOwnedSlice(), .module_name = module_name };
-        };
-        defer allocator.free(ordinal_array);
+        const export_table_addr = self.base_address + export_table_info.VirtualAddress;
+        const export_table_end = export_table_addr + export_table_info.Size;
 
-        const name_array_address = module_address + export_directory.AddressOfNames;
-        const name_array = memory.readMemoryFullArray(u32, mem_source, name_array_address, export_directory.NumberOfNames, allocator) catch {
-            return .{ .exports = try exports.toOwnedSlice(), .module_name = module_name };
+        const export_directory = memory.readProcessMemoryData(IMAGE_EXPORT_DIRECTORY, process, export_table_addr) catch |err| {
+            print("Failed to read export directory: {any}\n", .{err});
+            return err;
         };
-        defer allocator.free(name_array);
 
-        const address_table_address = module_address + export_directory.AddressOfFunctions;
-        const address_table = memory.readMemoryFullArray(u32, mem_source, address_table_address, export_directory.NumberOfFunctions, allocator) catch {
-            return .{ .exports = try exports.toOwnedSlice(), .module_name = module_name };
+        // Update module name from exports if we don't have one
+        if (std.mem.eql(u8, self.name, "unknown") and export_directory.Name != 0) {
+            const name_addr = self.base_address + export_directory.Name;
+            const new_name = memory.readProcessMemoryString(allocator, process, name_addr, 512, false) catch {
+                return;
+            };
+            allocator.free(self.name);
+            self.name = new_name;
+        }
+
+        // Read address table
+        const address_table_address = self.base_address + export_directory.AddressOfFunctions;
+        const address_table = memory.readProcessMemoryArray(u32, allocator, process, address_table_address, export_directory.NumberOfFunctions) catch |err| {
+            print("Failed to read address table: {any}\n", .{err});
+            return err;
         };
         defer allocator.free(address_table);
 
+        // Read ordinal and name arrays
+        const ordinal_array_address = self.base_address + export_directory.AddressOfNameOrdinals;
+        const ordinal_array = memory.readProcessMemoryArray(u16, allocator, process, ordinal_array_address, export_directory.NumberOfNames) catch |err| {
+            print("Failed to read ordinal array: {any}\n", .{err});
+            return err;
+        };
+        defer allocator.free(ordinal_array);
+
+        const name_array_address = self.base_address + export_directory.AddressOfNames;
+        const name_array = memory.readProcessMemoryArray(u32, allocator, process, name_array_address, export_directory.NumberOfNames) catch |err| {
+            print("Failed to read name array: {any}\n", .{err});
+            return err;
+        };
+        defer allocator.free(name_array);
+
+        // Process each export
         for (address_table, 0..) |function_address, unbiased_ordinal| {
             const ordinal = export_directory.Base + @as(u32, @intCast(unbiased_ordinal));
-            const target_address = module_address + function_address;
+            const target_address = self.base_address + function_address;
 
             // Find name for this ordinal
-            var name_index: ?usize = null;
-            for (ordinal_array, 0..) |ord, idx| {
-                if (ord == unbiased_ordinal) {
-                    name_index = idx;
+            var export_name: ?[]u8 = null;
+            for (ordinal_array, 0..) |ord, name_idx| {
+                if (ord == @as(u16, @intCast(unbiased_ordinal))) {
+                    const name_address = self.base_address + name_array[name_idx];
+                    export_name = memory.readProcessMemoryString(allocator, process, name_address, 4096, false) catch |err| {
+                        print("Failed to read export name: {any}\n", .{err});
+                        continue;
+                    };
                     break;
                 }
             }
 
-            const export_name = if (name_index) |idx| blk: {
-                const name_address = module_address + name_array[idx];
-                const name_str = memory.readMemoryString(mem_source, name_address, 4096, false, allocator) catch null;
-                break :blk name_str;
-            } else null;
-
-            // An address that falls inside the export directory is actually a forwarder
-            const target = if (target_address >= export_table_addr and target_address < export_table_end) blk: {
-                const forwarding_name = memory.readMemoryString(mem_source, target_address, 4096, false, allocator) catch {
-                    break :blk ExportTarget{ .RVA = target_address };
+            // Check if this is a forwarder
+            var target: ExportTarget = undefined;
+            if (target_address >= export_table_addr and target_address < export_table_end) {
+                // This is a forwarder
+                const forwarding_name = memory.readProcessMemoryString(allocator, process, target_address, 4096, false) catch |err| {
+                    print("Failed to read forwarder name: {any}\n", .{err});
+                    if (export_name) |name| allocator.free(name);
+                    continue;
                 };
-                break :blk ExportTarget{ .Forwarder = forwarding_name };
-            } else blk: {
-                break :blk ExportTarget{ .RVA = target_address };
-            };
+                target = ExportTarget{ .Forwarder = forwarding_name };
+            } else {
+                // Normal export
+                target = ExportTarget{ .RVA = target_address };
+            }
 
-            try exports.append(Export{
+            try self.exports.append(Export{
                 .name = export_name,
                 .ordinal = ordinal,
                 .target = target,
@@ -281,141 +360,70 @@ fn readExports(allocator: std.mem.Allocator, pe_header: IMAGE_NT_HEADERS64, modu
         }
     }
 
-    return .{ .exports = try exports.toOwnedSlice(), .module_name = module_name };
-}
+    fn readDebugInfo(self: *Self, allocator: Allocator, pe_header: IMAGE_NT_HEADERS64, process: windows.HANDLE) !void {
+        const debug_table_info = pe_header.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
+        if (debug_table_info.VirtualAddress == 0) {
+            return; // No debug info
+        }
 
-pub const Module = struct {
-    name: []const u8,
-    address: u64,
-    size: u64,
-    allocator: std.mem.Allocator,
-    exports: std.ArrayList(Export),
-    optional_header: ?IMAGE_OPTIONAL_HEADER64,
-    pe_header: ?IMAGE_NT_HEADERS64,
-    pdb_name: ?[]const u8,
-    pdb_info: ?PdbInfo,
+        const dir_size = @sizeOf(IMAGE_DEBUG_DIRECTORY);
+        const count = @min(debug_table_info.Size / dir_size, 20); // Limit to 20 entries
 
-    pub fn init(allocator: std.mem.Allocator, address: u64, name: ?[]const u8, mem_source: memory.MemorySource) !Module {
-        return fromMemoryView(allocator, address, name, mem_source);
-    }
-
-    pub fn fromMemoryView(allocator: std.mem.Allocator, module_address: u64, module_name: ?[]const u8, mem_source: memory.MemorySource) !Module {
-        // Read full PE header
-        const pe_header = readPeHeaderFull(allocator, module_address, mem_source) catch |err| {
-            const fallback_name = if (module_name) |n| blk: {
-                const owned_name = try allocator.dupe(u8, n);
-                break :blk owned_name;
-            } else blk: {
-                const default_name = try std.fmt.allocPrint(allocator, "module_{x}", .{module_address});
-                break :blk default_name;
+        for (0..count) |dir_index| {
+            const debug_directory_address = self.base_address + debug_table_info.VirtualAddress + (dir_index * dir_size);
+            const debug_directory = memory.readProcessMemoryData(IMAGE_DEBUG_DIRECTORY, process, debug_directory_address) catch |err| {
+                print("Failed to read debug directory: {any}\n", .{err});
+                continue;
             };
 
-            std.debug.print("Warning: Failed to read PE header for {s}: {}\n", .{ fallback_name, err });
+            if (debug_directory.Type == IMAGE_DEBUG_TYPE_CODEVIEW) {
+                const pdb_info_address = self.base_address + debug_directory.AddressOfRawData;
+                _ = memory.readProcessMemoryData(PDB_INFO, process, pdb_info_address) catch |err| {
+                    print("Failed to read PDB info: {any}\n", .{err});
+                    continue;
+                };
 
-            return Module{
-                .name = fallback_name,
-                .address = module_address,
-                .size = 0x100000, // 1MB default
-                .allocator = allocator,
-                .exports = std.ArrayList(Export).init(allocator),
-                .optional_header = null,
-                .pe_header = null,
-                .pdb_name = null,
-                .pdb_info = null,
+                // Read PDB name
+                const pdb_name_address = pdb_info_address + @sizeOf(PDB_INFO);
+                self.pdb_name = memory.readProcessMemoryString(allocator, process, pdb_name_address, MAX_PATH, false) catch |err| {
+                    print("Failed to read PDB name: {any}\n", .{err});
+                    continue;
+                };
+
+                break;
+            }
+        }
+    }
+
+    fn readSections(self: *Self, _: Allocator, pe_header: IMAGE_NT_HEADERS64, process: windows.HANDLE) !void {
+        // Section headers come right after the optional header
+        const dos_header_addr = self.base_address;
+        const dos_header = memory.readProcessMemoryData(IMAGE_DOS_HEADER, process, dos_header_addr) catch return;
+
+        const pe_header_addr = self.base_address + @as(u64, @intCast(dos_header.e_lfanew));
+        const sections_addr = pe_header_addr + @sizeOf(IMAGE_NT_HEADERS64);
+
+        for (0..pe_header.FileHeader.NumberOfSections) |i| {
+            const section_addr = sections_addr + (i * @sizeOf(IMAGE_SECTION_HEADER));
+            const section = memory.readProcessMemoryData(IMAGE_SECTION_HEADER, process, section_addr) catch |err| {
+                print("Failed to read section header {}: {any}\n", .{ i, err });
+                continue;
             };
-        };
-
-        // Check machine architecture
-        if (pe_header.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) {
-            return error.UnsupportedMachineArchitecture;
+            try self.sections.append(section);
         }
-
-        const size = pe_header.OptionalHeader.SizeOfImage;
-
-        // Read debug info (PDB)
-        const debug_result = readDebugInfo(allocator, pe_header, module_address, mem_source) catch .{ .pdb_info = null, .pdb_name = null };
-
-        // Read exports
-        var exports_list = std.ArrayList(Export).init(allocator);
-        var export_module_name: ?[]const u8 = null;
-
-        if (readExports(allocator, pe_header, module_address, mem_source)) |result| {
-            exports_list.appendSlice(result.exports) catch {};
-            export_module_name = result.module_name;
-            if (result.exports.len > 0) {
-                allocator.free(result.exports);
-            }
-        } else |err| {
-            std.debug.print("Warning: Failed to read exports: {}\n", .{err});
-        }
-
-        // Determine final module name (prefer export table name, then provided name, then fallback)
-        const final_name = if (export_module_name) |n|
-            n
-        else if (module_name) |n|
-            try allocator.dupe(u8, n)
-        else
-            try std.fmt.allocPrint(allocator, "module_{X}", .{module_address});
-
-        return Module{
-            .name = final_name,
-            .address = module_address,
-            .size = size,
-            .allocator = allocator,
-            .exports = exports_list,
-            .optional_header = pe_header.OptionalHeader,
-            .pe_header = pe_header,
-            .pdb_name = debug_result.pdb_name,
-            .pdb_info = debug_result.pdb_info,
-        };
     }
 
-    pub fn deinit(self: *Module) void {
-        self.allocator.free(self.name);
-        if (self.pdb_name) |pdb_name| {
-            self.allocator.free(pdb_name);
-        }
-
-        // Free export names and forwarder names
-        for (self.exports.items) |exp| {
-            if (exp.name) |name| {
-                self.allocator.free(name);
-            }
-            switch (exp.target) {
-                .Forwarder => |fwd| self.allocator.free(fwd),
-                .RVA => {},
+    pub fn findSection(self: *const Self, name: []const u8) ?*const IMAGE_SECTION_HEADER {
+        for (self.sections.items) |*section| {
+            const section_name = std.mem.sliceTo(&section.Name, 0);
+            if (std.mem.eql(u8, section_name, name)) {
+                return section;
             }
         }
-        self.exports.deinit();
+        return null;
     }
 
-    pub fn containsAddress(self: Module, address: u64) bool {
-        const end = self.address + self.size;
-        return self.address <= address and address < end;
+    pub fn getPDataSection(self: *const Self) ?*const IMAGE_SECTION_HEADER {
+        return self.findSection(".pdata");
     }
-
-    pub fn getDataDirectory(self: Module, entry: u32) IMAGE_DATA_DIRECTORY {
-        if (self.pe_header) |pe_header| {
-            if (entry < pe_header.OptionalHeader.DataDirectory.len) {
-                return pe_header.OptionalHeader.DataDirectory[entry];
-            }
-        }
-        // Return empty directory if no PE header available
-        return IMAGE_DATA_DIRECTORY{ .VirtualAddress = 0, .Size = 0 };
-    }
-};
-
-pub const Export = struct {
-    name: ?[]const u8,
-    ordinal: u32,
-    target: ExportTarget,
-
-    pub fn toString(self: Export) []const u8 {
-        return if (self.name) |name| name else "unnamed";
-    }
-};
-
-pub const ExportTarget = union(enum) {
-    RVA: u64,
-    Forwarder: []const u8,
 };

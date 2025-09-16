@@ -1,418 +1,327 @@
 const std = @import("std");
 const windows = std.os.windows;
-const WINAPI = windows.WINAPI;
 const print = std.debug.print;
 const Allocator = std.mem.Allocator;
 
-const util = @import("util.zig");
 const memory = @import("memory.zig");
-const process = @import("process.zig");
+const Process = @import("process.zig").Process;
 
-// Windows API types
-const DWORD = windows.DWORD;
-const CONTEXT = util.CONTEXT;
+const IMAGE_DOS_HEADER = @import("module.zig").IMAGE_DOS_HEADER;
+const IMAGE_NT_HEADERS64 = @import("module.zig").IMAGE_NT_HEADERS64;
 
-// Windows PE constants
-const IMAGE_DIRECTORY_ENTRY_EXCEPTION: DWORD = 3;
+// Exception directory entry index
+const IMAGE_DIRECTORY_ENTRY_EXCEPTION = 3;
 
-// Runtime function structure for x64 stack unwinding
-const RUNTIME_FUNCTION = packed struct {
+// PE constants
+const IMAGE_DOS_SIGNATURE = 0x5A4D; // MZ
+const IMAGE_NT_SIGNATURE = 0x00004550; // PE00
+
+// Stack unwinding structures
+pub const RUNTIME_FUNCTION = extern struct {
     BeginAddress: u32,
     EndAddress: u32,
     UnwindInfo: u32,
 };
 
-// Unwind info header structure
-const UNWIND_INFO = packed struct {
+pub const UNWIND_INFO = extern struct {
     version_flags: u8,
     size_of_prolog: u8,
     count_of_codes: u8,
     frame_register_offset: u8,
 };
 
-// Unwind code structure
-const UNWIND_CODE = packed struct {
-    code_offset: u8,
+pub const UNWIND_CODE = extern struct {
+    offset_in_prolog: u8,
     unwind_op_info: u8,
 };
 
-// Unwind operation constants
-const UWOP_PUSH_NONVOL: u8 = 0;
-const UWOP_ALLOC_LARGE: u8 = 1;
-const UWOP_ALLOC_SMALL: u8 = 2;
-const UWOP_SET_FPREG: u8 = 3;
-const UWOP_SAVE_NONVOL: u8 = 4;
-const UWOP_SAVE_NONVOL_FAR: u8 = 5;
-const UWOP_SAVE_XMM128: u8 = 8;
-const UWOP_SAVE_XMM128_FAR: u8 = 9;
-const UWOP_PUSH_MACHFRAME: u8 = 10;
+// Unwind operation codes
+const UWOP_PUSH_NONVOL = 0;
+const UWOP_ALLOC_LARGE = 1;
+const UWOP_ALLOC_SMALL = 2;
+const UWOP_SET_FPREG = 3;
+const UWOP_SAVE_NONVOL = 4;
+const UWOP_SAVE_NONVOL_FAR = 5;
+const UWOP_SAVE_XMM128 = 8;
+const UWOP_SAVE_XMM128_FAR = 9;
+const UWOP_PUSH_MACHFRAME = 10;
 
-// Unwind flags
-const UNW_FLAG_NHANDLER: u8 = 0x0;
-const UNW_FLAG_EHANDLER: u8 = 0x1;
-const UNW_FLAG_UHANDLER: u8 = 0x2;
-const UNW_FLAG_CHAININFO: u8 = 0x4;
+// Stack frame structure for call stack
+pub const StackFrame = struct {
+    rip: u64,
+    rsp: u64,
+    rbp: u64,
 
-// Logical unwind operations
-const UnwindOp = union(enum) {
-    PushNonVolatile: struct { reg: u8 },
-    Alloc: struct { size: u32 },
-    SetFpreg: struct { frame_register: u8, frame_offset: u16 },
-    SaveNonVolatile: struct { reg: u8, offset: u32 },
-    SaveXmm128: struct { reg: u8, offset: u32 },
-    PushMachFrame: struct { error_code: bool },
+    const Self = @This();
 };
 
-// Unwind code with operation
-const UnwindCode = struct {
-    code_offset: u8,
-    op: UnwindOp,
+// Stack unwinding functions
+pub fn findRuntimeFunction(process_info: *Process, process: windows.HANDLE, rip: u64) ?RUNTIME_FUNCTION {
+    const module = process_info.getContainingModule(rip) orelse {
+        return null;
+    };
 
-    pub fn deinit(self: *UnwindCode, allocator: Allocator) void {
-        _ = self;
-        _ = allocator;
-        // Nothing to deallocate for now
+    // Read exception directory from PE headers
+    const dos_header = memory.readProcessMemoryData(IMAGE_DOS_HEADER, process, module.base_address) catch |err| {
+        print("Failed to read DOS header: {any}\n", .{err});
+        return null;
+    };
+    if (dos_header.e_magic != IMAGE_DOS_SIGNATURE) return null;
+
+    const pe_header_addr = module.base_address + @as(u64, @intCast(dos_header.e_lfanew));
+    const pe_header = memory.readProcessMemoryData(IMAGE_NT_HEADERS64, process, pe_header_addr) catch |err| {
+        print("Failed to read PE header: {any}\n", .{err});
+        return null;
+    };
+    if (pe_header.Signature != IMAGE_NT_SIGNATURE) return null;
+
+    const exception_dir = pe_header.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    if (exception_dir.VirtualAddress == 0) {
+        return null;
     }
-};
 
-// Stack unwinding errors
-pub const StackError = error{
-    NoUnwindData,
-    IncompleteUnwindCode,
-    UnrecognizedUnwindOp,
-    MemoryReadError,
-    ChainedInfoNotImplemented,
-};
+    const exception_table_addr = module.base_address + exception_dir.VirtualAddress;
+    const num_functions = exception_dir.Size / @sizeOf(RUNTIME_FUNCTION);
 
-// Find runtime function containing the given RVA
-fn findRuntimeFunction(addr: u32, function_list: []const RUNTIME_FUNCTION) ?*const RUNTIME_FUNCTION {
-    // Binary search for the function containing this address
-    var left: usize = 0;
-    var right: usize = function_list.len;
+    // Binary search through runtime functions
+    var left: u32 = 0;
+    var right: u32 = num_functions;
 
     while (left < right) {
         const mid = left + (right - left) / 2;
-        const func = &function_list[mid];
+        const func_addr = exception_table_addr + (mid * @sizeOf(RUNTIME_FUNCTION));
 
-        if (addr < func.BeginAddress) {
+        const runtime_func = memory.readProcessMemoryData(RUNTIME_FUNCTION, process, func_addr) catch |err| {
+            print("Failed to read RUNTIME_FUNCTION: {any}\n", .{err});
+            return null;
+        };
+        const func_start = module.base_address + runtime_func.BeginAddress;
+        const func_end = module.base_address + runtime_func.EndAddress;
+
+        if (rip >= func_start and rip < func_end) {
+            return runtime_func;
+        } else if (rip < func_start) {
             right = mid;
-        } else if (addr >= func.EndAddress) {
-            left = mid + 1;
         } else {
-            return func;
-        }
-    }
-
-    // Check boundaries for inexact matches
-    if (left > 0) {
-        const func = &function_list[left - 1];
-        if (func.BeginAddress <= addr and addr < func.EndAddress) {
-            return func;
+            left = mid + 1;
         }
     }
 
     return null;
 }
 
-// Split bitfield values (mimics the Rust macro)
-fn splitBits2(comptime T: type, value: T, comptime size1: u8, comptime size2: u8) struct { u8, u8 } {
-    const mask1 = (@as(T, 1) << size1) - 1;
-    const field1 = @as(u8, @intCast(value & mask1));
-    const field2 = @as(u8, @intCast((value >> size1) & ((@as(T, 1) << size2) - 1)));
-    return .{ field1, field2 };
-}
+pub fn unwindContext(allocator: Allocator, process_info: *Process, process: windows.HANDLE, context: windows.CONTEXT) ?windows.CONTEXT {
+    const runtime_func = findRuntimeFunction(process_info, process, context.Rip) orelse {
+        return null;
+    };
+    const module = process_info.getContainingModule(context.Rip) orelse {
+        return null;
+    };
 
-fn splitBits4(comptime T: type, value: T, comptime size1: u8, comptime size2: u8, comptime size3: u8, comptime size4: u8) struct { u8, u8, u8, u8 } {
-    var temp_value = value;
-    const field1 = @as(u8, @intCast(temp_value & ((@as(T, 1) << size1) - 1)));
-    temp_value >>= size1;
-    const field2 = @as(u8, @intCast(temp_value & ((@as(T, 1) << size2) - 1)));
-    temp_value >>= size2;
-    const field3 = @as(u8, @intCast(temp_value & ((@as(T, 1) << size3) - 1)));
-    temp_value >>= size3;
-    const field4 = @as(u8, @intCast(temp_value & ((@as(T, 1) << size4) - 1)));
-    return .{ field1, field2, field3, field4 };
-}
+    // Read unwind info
+    const unwind_info_addr = module.base_address + runtime_func.UnwindInfo;
+    const unwind_info = memory.readProcessMemoryData(UNWIND_INFO, process, unwind_info_addr) catch {
+        return null;
+    };
 
-// Parse unwind operations from unwind codes
-fn getUnwindOps(allocator: Allocator, code_slots: []const u16, frame_register: u8, frame_offset: u16) ![]UnwindCode {
-    var ops = std.ArrayList(UnwindCode).init(allocator);
-    defer ops.deinit();
+    // Create a new context for unwinding
+    var new_context = context;
 
-    var i: usize = 0;
-    while (i < code_slots.len) {
-        const split = splitBits4(u16, code_slots[i], 8, 4, 4, 0);
-        const code_offset = split[0];
-        const unwind_op = split[1];
-        const op_info = split[2];
+    // Read unwind codes
+    const codes_addr = unwind_info_addr + @sizeOf(UNWIND_INFO);
+    const codes = memory.readProcessMemoryArray(UNWIND_CODE, allocator, process, codes_addr, unwind_info.count_of_codes) catch {
+        return null;
+    };
+    defer allocator.free(codes);
+
+    // Process unwind codes in reverse order
+    var i = codes.len;
+    while (i > 0) {
+        i -= 1;
+        const code = codes[i];
+        const unwind_op = code.unwind_op_info & 0x0F;
+        const op_info = (code.unwind_op_info & 0xF0) >> 4;
 
         switch (unwind_op) {
             UWOP_PUSH_NONVOL => {
-                try ops.append(UnwindCode{
-                    .code_offset = code_offset,
-                    .op = UnwindOp{ .PushNonVolatile = .{ .reg = op_info } },
-                });
+                // Pop register from stack
+                const reg_value = memory.readProcessMemoryData(u64, process, new_context.Rsp) catch return null;
+                new_context.Rsp += 8;
+
+                // Restore the register based on op_info
+                switch (op_info) {
+                    0 => new_context.Rax = reg_value,
+                    1 => new_context.Rcx = reg_value,
+                    2 => new_context.Rdx = reg_value,
+                    3 => new_context.Rbx = reg_value,
+                    5 => new_context.Rbp = reg_value,
+                    6 => new_context.Rsi = reg_value,
+                    7 => new_context.Rdi = reg_value,
+                    8 => new_context.R8 = reg_value,
+                    9 => new_context.R9 = reg_value,
+                    10 => new_context.R10 = reg_value,
+                    11 => new_context.R11 = reg_value,
+                    12 => new_context.R12 = reg_value,
+                    13 => new_context.R13 = reg_value,
+                    14 => new_context.R14 = reg_value,
+                    15 => new_context.R15 = reg_value,
+                    else => {},
+                }
             },
             UWOP_ALLOC_LARGE => {
+                // Large stack allocation
                 if (op_info == 0) {
-                    if (i + 1 >= code_slots.len) {
-                        return StackError.IncompleteUnwindCode;
+                    // Size is in next slot * 8
+                    if (i > 0) {
+                        i -= 1;
+                        const size_code = codes[i];
+                        const alloc_size = (@as(u64, size_code.unwind_op_info) << 8) | size_code.offset_in_prolog;
+                        new_context.Rsp += alloc_size * 8;
                     }
-                    const size = @as(u32, code_slots[i + 1]) * 8;
-                    try ops.append(UnwindCode{
-                        .code_offset = code_offset,
-                        .op = UnwindOp{ .Alloc = .{ .size = size } },
-                    });
-                    i += 1;
-                } else if (op_info == 1) {
-                    if (i + 2 >= code_slots.len) {
-                        return StackError.IncompleteUnwindCode;
+                } else {
+                    // Size is in next two slots
+                    if (i > 1) {
+                        i -= 1;
+                        const low_code = codes[i];
+                        i -= 1;
+                        const high_code = codes[i];
+                        const alloc_size = (@as(u64, high_code.unwind_op_info) << 24) |
+                            (@as(u64, high_code.offset_in_prolog) << 16) |
+                            (@as(u64, low_code.unwind_op_info) << 8) |
+                            low_code.offset_in_prolog;
+                        new_context.Rsp += alloc_size;
                     }
-                    const size = @as(u32, code_slots[i + 1]) + (@as(u32, code_slots[i + 2]) << 16);
-                    try ops.append(UnwindCode{
-                        .code_offset = code_offset,
-                        .op = UnwindOp{ .Alloc = .{ .size = size } },
-                    });
-                    i += 2;
                 }
             },
             UWOP_ALLOC_SMALL => {
-                const size = @as(u32, op_info) * 8 + 8;
-                try ops.append(UnwindCode{
-                    .code_offset = code_offset,
-                    .op = UnwindOp{ .Alloc = .{ .size = size } },
-                });
+                // Small stack allocation
+                const alloc_size = (@as(u64, op_info) * 8) + 8;
+                new_context.Rsp += alloc_size;
             },
             UWOP_SET_FPREG => {
-                try ops.append(UnwindCode{
-                    .code_offset = code_offset,
-                    .op = UnwindOp{ .SetFpreg = .{ .frame_register = frame_register, .frame_offset = frame_offset } },
-                });
+                // Frame pointer was set
+                const frame_offset = (@as(u64, @intCast(unwind_info.frame_register_offset & 0x0F))) * 16;
+                new_context.Rsp = new_context.Rbp - frame_offset;
             },
             UWOP_SAVE_NONVOL => {
-                if (i + 1 >= code_slots.len) {
-                    return StackError.IncompleteUnwindCode;
+                // Restore non-volatile register from stack
+                if (i > 0) {
+                    i -= 1;
+                    const offset_code = codes[i];
+                    const offset = (@as(u64, offset_code.unwind_op_info) << 8) | offset_code.offset_in_prolog;
+                    const saved_address = new_context.Rsp + (offset * 8);
+                    const reg_value = memory.readProcessMemoryData(u64, process, saved_address) catch continue;
+
+                    // Restore the register based on op_info
+                    switch (op_info) {
+                        0 => new_context.Rax = reg_value,
+                        1 => new_context.Rcx = reg_value,
+                        2 => new_context.Rdx = reg_value,
+                        3 => new_context.Rbx = reg_value,
+                        5 => new_context.Rbp = reg_value,
+                        6 => new_context.Rsi = reg_value,
+                        7 => new_context.Rdi = reg_value,
+                        8 => new_context.R8 = reg_value,
+                        9 => new_context.R9 = reg_value,
+                        10 => new_context.R10 = reg_value,
+                        11 => new_context.R11 = reg_value,
+                        12 => new_context.R12 = reg_value,
+                        13 => new_context.R13 = reg_value,
+                        14 => new_context.R14 = reg_value,
+                        15 => new_context.R15 = reg_value,
+                        else => {},
+                    }
                 }
-                const offset = @as(u32, code_slots[i + 1]);
-                try ops.append(UnwindCode{
-                    .code_offset = code_offset,
-                    .op = UnwindOp{ .SaveNonVolatile = .{ .reg = op_info, .offset = offset } },
-                });
-                i += 1;
             },
             UWOP_SAVE_NONVOL_FAR => {
-                if (i + 2 >= code_slots.len) {
-                    return StackError.IncompleteUnwindCode;
+                // Restore non-volatile register from stack (far offset)
+                if (i > 1) {
+                    i -= 1;
+                    const low_code = codes[i];
+                    i -= 1;
+                    const high_code = codes[i];
+                    const offset = (@as(u64, high_code.unwind_op_info) << 24) |
+                        (@as(u64, high_code.offset_in_prolog) << 16) |
+                        (@as(u64, low_code.unwind_op_info) << 8) |
+                        low_code.offset_in_prolog;
+                    const saved_address = new_context.Rsp + offset;
+                    const reg_value = memory.readProcessMemoryData(u64, process, saved_address) catch continue;
+
+                    // Restore the register based on op_info
+                    switch (op_info) {
+                        0 => new_context.Rax = reg_value,
+                        1 => new_context.Rcx = reg_value,
+                        2 => new_context.Rdx = reg_value,
+                        3 => new_context.Rbx = reg_value,
+                        5 => new_context.Rbp = reg_value,
+                        6 => new_context.Rsi = reg_value,
+                        7 => new_context.Rdi = reg_value,
+                        8 => new_context.R8 = reg_value,
+                        9 => new_context.R9 = reg_value,
+                        10 => new_context.R10 = reg_value,
+                        11 => new_context.R11 = reg_value,
+                        12 => new_context.R12 = reg_value,
+                        13 => new_context.R13 = reg_value,
+                        14 => new_context.R14 = reg_value,
+                        15 => new_context.R15 = reg_value,
+                        else => {},
+                    }
                 }
-                const offset = @as(u32, code_slots[i + 1]) + (@as(u32, code_slots[i + 2]) << 16);
-                try ops.append(UnwindCode{
-                    .code_offset = code_offset,
-                    .op = UnwindOp{ .SaveNonVolatile = .{ .reg = op_info, .offset = offset } },
-                });
-                i += 2;
             },
             UWOP_SAVE_XMM128 => {
-                if (i + 1 >= code_slots.len) {
-                    return StackError.IncompleteUnwindCode;
+                // Skip XMM register saves for basic stack walking
+                // XMM registers don't affect call stack unwinding
+                if (i > 0) {
+                    i -= 1; // Skip the offset slot
                 }
-                const offset = @as(u32, code_slots[i + 1]);
-                try ops.append(UnwindCode{
-                    .code_offset = code_offset,
-                    .op = UnwindOp{ .SaveXmm128 = .{ .reg = op_info, .offset = offset } },
-                });
-                i += 1;
             },
             UWOP_SAVE_XMM128_FAR => {
-                if (i + 2 >= code_slots.len) {
-                    return StackError.IncompleteUnwindCode;
+                // Skip XMM register saves for basic stack walking
+                // XMM registers don't affect call stack unwinding
+                if (i > 1) {
+                    i -= 2; // Skip the two offset slots
                 }
-                const offset = @as(u32, code_slots[i + 1]) + (@as(u32, code_slots[i + 2]) << 16);
-                try ops.append(UnwindCode{
-                    .code_offset = code_offset,
-                    .op = UnwindOp{ .SaveXmm128 = .{ .reg = op_info, .offset = offset } },
-                });
-                i += 2;
             },
             UWOP_PUSH_MACHFRAME => {
-                try ops.append(UnwindCode{
-                    .code_offset = code_offset,
-                    .op = UnwindOp{ .PushMachFrame = .{ .error_code = op_info != 0 } },
-                });
+                // Machine frame push - adjust stack for hardware frame
+                if (op_info == 0) {
+                    // No error code - 5 slots: SS, RSP, EFLAGS, CS, RIP
+                    new_context.Rsp += 5 * 8;
+                } else {
+                    // With error code - 6 slots: SS, RSP, EFLAGS, CS, RIP, ErrorCode
+                    new_context.Rsp += 6 * 8;
+                }
             },
-            else => return StackError.UnrecognizedUnwindOp,
-        }
-        i += 1;
-    }
-
-    return ops.toOwnedSlice();
-}
-
-// Get register reference by register number
-fn getOpRegister(context: *CONTEXT, reg: u8) *u64 {
-    return switch (reg) {
-        0 => &context.Rax,
-        1 => &context.Rcx,
-        2 => &context.Rdx,
-        3 => &context.Rbx,
-        4 => &context.Rsp,
-        5 => &context.Rbp,
-        6 => &context.Rsi,
-        7 => &context.Rdi,
-        8 => &context.R8,
-        9 => &context.R9,
-        10 => &context.R10,
-        11 => &context.R11,
-        12 => &context.R12,
-        13 => &context.R13,
-        14 => &context.R14,
-        15 => &context.R15,
-        else => unreachable,
-    };
-}
-
-// Apply unwind operations to context
-fn applyUnwindOps(allocator: Allocator, context: *const CONTEXT, unwind_ops: []const UnwindCode, func_address: u64, mem_source: memory.MemorySource) !?CONTEXT {
-    var unwound_context = context.*;
-
-    for (unwind_ops) |unwind| {
-        const func_offset = unwound_context.Rip - func_address;
-        if (unwind.code_offset <= func_offset) {
-            switch (unwind.op) {
-                .Alloc => |alloc| {
-                    unwound_context.Rsp += alloc.size;
-                },
-                .PushNonVolatile => |push| {
-                    const addr = unwound_context.Rsp;
-                    const val = memory.readMemoryData(u64, mem_source, addr, allocator) catch return StackError.MemoryReadError;
-                    getOpRegister(&unwound_context, push.reg).* = val;
-                    unwound_context.Rsp += 8;
-                },
-                .SaveNonVolatile => |save| {
-                    const addr = unwound_context.Rsp + save.offset;
-                    const val = memory.readMemoryData(u64, mem_source, addr, allocator) catch return StackError.MemoryReadError;
-                    getOpRegister(&unwound_context, save.reg).* = val;
-                },
-                .SetFpreg => |fpreg| {
-                    unwound_context.Rsp = getOpRegister(&unwound_context, fpreg.frame_register).* - fpreg.frame_offset;
-                },
-                .PushMachFrame => |machframe| {
-                    if (machframe.error_code) {
-                        // Skip the error code on stack
-                        unwound_context.Rsp += 8;
-                    }
-                    // The return address is already at RSP
-                },
-                else => {
-                    // NYI: Other unwind operations
-                    print("NYI: Unwind operation not yet implemented\n", .{});
-                },
-            }
+            else => {
+                print("unsupported frame {any} {any}\n", .{ unwind_op, unwind_info });
+                // Skip unsupported unwind operations for now
+            },
         }
     }
 
-    return unwound_context;
-}
-
-// Main stack unwinding function
-pub fn unwindContext(allocator: Allocator, proc: *process.Process, context: CONTEXT, mem_source: memory.MemorySource) !?CONTEXT {
-    const module_opt = proc.getContainingModule(context.Rip);
-    if (module_opt) |mod| {
-        // Get exception data directory
-        const data_directory = mod.getDataDirectory(IMAGE_DIRECTORY_ENTRY_EXCEPTION);
-
-        if (data_directory.VirtualAddress != 0 and data_directory.Size != 0) {
-            const count = data_directory.Size / @sizeOf(RUNTIME_FUNCTION);
-            const table_address = mod.address + data_directory.VirtualAddress;
-
-            // Read runtime function table
-            var functions = std.ArrayList(RUNTIME_FUNCTION).init(allocator);
-            defer functions.deinit();
-            try functions.resize(count);
-
-            const table_bytes = try mem_source.readRawMemory(table_address, functions.items.len * @sizeOf(RUNTIME_FUNCTION), allocator);
-            defer allocator.free(table_bytes);
-            @memcpy(std.mem.sliceAsBytes(functions.items), table_bytes);
-
-            const rva = @as(u32, @intCast(context.Rip - mod.address));
-            const func_opt = findRuntimeFunction(rva, functions.items);
-
-            if (func_opt) |func| {
-                // We have unwind data
-                const info_addr = mod.address + func.UnwindInfo;
-                const info = memory.readMemoryData(UNWIND_INFO, mem_source, info_addr, allocator) catch return StackError.MemoryReadError;
-
-                const split = splitBits2(u8, info.version_flags, 3, 5);
-                const flags = split[1];
-
-                if (flags & UNW_FLAG_CHAININFO == UNW_FLAG_CHAININFO) {
-                    return StackError.ChainedInfoNotImplemented;
-                }
-
-                const reg_split = splitBits2(u8, info.frame_register_offset, 4, 4);
-                const frame_register = reg_split[0];
-                const frame_offset = @as(u16, reg_split[1]) * 16;
-
-                // Read unwind codes
-                const codes_size = info.count_of_codes;
-                var codes = std.ArrayList(u16).init(allocator);
-                defer codes.deinit();
-                try codes.resize(codes_size);
-
-                const codes_bytes = try mem_source.readRawMemory(info_addr + 4, codes.items.len * @sizeOf(u16), allocator);
-                defer allocator.free(codes_bytes);
-                @memcpy(std.mem.sliceAsBytes(codes.items), codes_bytes);
-
-                // Parse unwind operations
-                const unwind_ops = try getUnwindOps(allocator, codes.items, frame_register, frame_offset);
-                defer allocator.free(unwind_ops);
-
-                if (try applyUnwindOps(allocator, &context, unwind_ops, mod.address + func.BeginAddress, mem_source)) |unwound_ctx| {
-                    var ctx = unwound_ctx;
-
-                    // Read return address from stack
-                    ctx.Rip = memory.readMemoryData(u64, mem_source, ctx.Rsp, allocator) catch return StackError.MemoryReadError;
-                    ctx.Rsp += 8;
-
-                    // Check for end of stack
-                    if (ctx.Rip == 0) {
-                        return null;
-                    }
-
-                    return ctx;
-                }
-
+    // Get return address from stack
+    const return_addr = memory.readProcessMemoryData(u64, process, new_context.Rsp) catch |err| {
+        // If structured unwinding fails, fall back to frame pointer method
+        if (context.Rbp != 0 and context.Rbp > context.Rsp) {
+            // Try to read the saved frame pointer and return address
+            const frame_data = memory.readProcessMemoryArray(u64, allocator, process, context.Rbp, 2) catch |frame_err| {
+                print("Debug: Both structured and frame pointer unwinding failed: {any}, {any}\n", .{ err, frame_err });
                 return null;
-            } else {
-                // Leaf function: return address is at [RSP]
-                var ctx = context;
-                ctx.Rip = memory.readMemoryData(u64, mem_source, ctx.Rsp, allocator) catch return StackError.MemoryReadError;
-                ctx.Rsp += 8;
-                return ctx;
+            };
+            defer allocator.free(frame_data);
+
+            if (frame_data.len >= 2 and frame_data[1] != 0) {
+                new_context.Rbp = frame_data[0];
+                new_context.Rip = frame_data[1];
+                new_context.Rsp = context.Rbp + 16; // Skip saved RBP and return address
+                return new_context;
             }
         }
-    }
+        print("Debug: Failed to read return address from stack at 0x{x}: {any}\n", .{ new_context.Rsp, err });
+        return null;
+    };
+    new_context.Rip = return_addr;
+    new_context.Rsp += 8; // Pop return address
 
-    return null;
-}
-
-// Walk the entire stack and print stack frames
-pub fn walkStack(allocator: Allocator, proc: *process.Process, context: CONTEXT, mem_source: memory.MemorySource) !void {
-    var current_context = context;
-    var frame_count: u32 = 0;
-
-    print("Call stack:\n", .{});
-
-    while (frame_count < 100) { // Limit to prevent infinite loops
-        // Print current frame
-        const module_name = if (proc.getContainingModule(current_context.Rip)) |mod| mod.name else "Unknown";
-        print("{:3} {X:0>16} {s}\n", .{ frame_count, current_context.Rip, module_name });
-
-        // Try to unwind to the next frame
-        if (try unwindContext(allocator, proc, current_context, mem_source)) |next_context| {
-            current_context = next_context;
-            frame_count += 1;
-        } else {
-            break;
-        }
-    }
+    return new_context;
 }

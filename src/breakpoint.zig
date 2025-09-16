@@ -1,199 +1,215 @@
 const std = @import("std");
 const windows = std.os.windows;
-const WINAPI = windows.WINAPI;
 const print = std.debug.print;
+const ArrayList = std.ArrayList;
+const Allocator = std.mem.Allocator;
 
-const util = @import("util.zig");
-const memory = @import("memory.zig");
-const process = @import("process.zig");
+const memory = @import("./memory.zig");
+const util = @import("./util.zig");
 const name_resolution = @import("name_resolution.zig");
 
-// Windows API types and functions
-const HANDLE = windows.HANDLE;
-const DWORD = windows.DWORD;
-const BOOL = windows.BOOL;
-const CONTEXT = util.CONTEXT;
-const AlignedContext = util.AlignedContext;
-const AutoClosedHandle = util.AutoClosedHandle;
+// Thread access rights
+const THREAD_GET_CONTEXT = 0x0008;
+const THREAD_SET_CONTEXT = 0x0010;
+const FALSE = windows.FALSE;
 
-const FALSE: BOOL = 0;
-const THREAD_GET_CONTEXT: DWORD = 0x0008;
-const THREAD_SET_CONTEXT: DWORD = 0x0010;
+// Context flags for x64
+const CONTEXT_AMD64 = 0x00100000;
+const CONTEXT_CONTROL = CONTEXT_AMD64 | 0x00000001;
+const CONTEXT_INTEGER = CONTEXT_AMD64 | 0x00000002;
+const CONTEXT_SEGMENTS = CONTEXT_AMD64 | 0x00000004;
+const CONTEXT_FLOATING_POINT = CONTEXT_AMD64 | 0x00000008;
+const CONTEXT_DEBUG_REGISTERS = CONTEXT_AMD64 | 0x00000010;
+const CONTEXT_ALL = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_FLOATING_POINT | CONTEXT_DEBUG_REGISTERS;
+
+// Resume flag for hardware breakpoints
+const EFLAG_RF = 16; // Bit position for Resume Flag in EFlags
+
+// Debug register constants
+const DR6_B_BIT = [4]usize{ 0, 1, 2, 3 }; // B0-B3 bits in DR6
+const DR7_LE_BIT = [4]usize{ 0, 2, 4, 6 }; // Local Enable bits in DR7
+const DR7_LEN_BIT = [4]usize{ 18, 22, 26, 30 }; // Length bits in DR7
+const DR7_LEN_SIZE = 2;
+const DR7_RW_BIT = [4]usize{ 16, 20, 24, 28 }; // Read/Write bits in DR7
+const DR7_RW_SIZE = 2;
 
 extern "kernel32" fn OpenThread(
-    dwDesiredAccess: DWORD,
-    bInheritHandle: BOOL,
-    dwThreadId: DWORD,
-) callconv(WINAPI) HANDLE;
+    dwDesiredAccess: windows.DWORD,
+    bInheritHandle: windows.BOOL,
+    dwThreadId: windows.DWORD,
+) callconv(windows.WINAPI) windows.HANDLE;
 
 extern "kernel32" fn GetThreadContext(
-    hThread: HANDLE,
-    lpContext: *CONTEXT,
-) callconv(WINAPI) BOOL;
+    hThread: windows.HANDLE,
+    lpContext: *windows.CONTEXT,
+) callconv(windows.WINAPI) windows.BOOL;
 
 extern "kernel32" fn SetThreadContext(
-    hThread: HANDLE,
-    lpContext: *const CONTEXT,
-) callconv(WINAPI) BOOL;
+    hThread: windows.HANDLE,
+    lpContext: *const windows.CONTEXT,
+) callconv(windows.WINAPI) windows.BOOL;
 
-// Debug register bit positions and sizes
-const DR7_LEN_BIT = [_]u6{ 19, 23, 27, 31 };
-const DR7_RW_BIT = [_]u6{ 17, 21, 25, 29 };
-const DR7_LE_BIT = [_]u6{ 0, 2, 4, 6 };
-const DR7_GE_BIT = [_]u6{ 1, 3, 5, 7 };
+extern "kernel32" fn CloseHandle(hObject: windows.HANDLE) callconv(windows.WINAPI) windows.BOOL;
 
-const DR7_LEN_SIZE: u6 = 2;
-const DR7_RW_SIZE: u6 = 2;
+// Auto-closing handle wrapper
+const AutoClosedHandle = struct {
+    handle: windows.HANDLE,
 
-const DR6_B_BIT = [_]u6{ 0, 1, 2, 3 };
+    const Self = @This();
 
-const EFLAG_RF: u6 = 16;
+    pub fn init(handle: windows.HANDLE) Self {
+        return Self{ .handle = handle };
+    }
 
-const Breakpoint = struct {
-    addr: u64,
-    id: u32,
+    pub fn deinit(self: *Self) void {
+        _ = CloseHandle(self.handle);
+    }
+
+    pub fn getHandle(self: *const Self) windows.HANDLE {
+        return self.handle;
+    }
 };
 
-pub const BreakpointManager = struct {
-    breakpoints: std.ArrayList(Breakpoint),
-    allocator: std.mem.Allocator,
+// 16-byte aligned context structure for x64
+const AlignedContext = struct {
+    context: windows.CONTEXT,
 
-    pub fn init(allocator: std.mem.Allocator) BreakpointManager {
-        return BreakpointManager{
-            .breakpoints = std.ArrayList(Breakpoint).init(allocator),
-            .allocator = allocator,
+    const Self = @This();
+
+    pub fn init() Self {
+        return Self{
+            .context = std.mem.zeroes(windows.CONTEXT),
+        };
+    }
+};
+
+// Breakpoint structure
+pub const Breakpoint = struct {
+    addr: u64,
+    id: u32,
+
+    const Self = @This();
+};
+
+// Breakpoint manager
+pub const BreakpointManager = struct {
+    breakpoints: ArrayList(Breakpoint),
+    next_id: u32,
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator) Self {
+        return Self{
+            .breakpoints = ArrayList(Breakpoint).init(allocator),
+            .next_id = 0,
         };
     }
 
-    pub fn deinit(self: *BreakpointManager) void {
+    pub fn deinit(self: *Self) void {
         self.breakpoints.deinit();
     }
 
-    fn getFreeId(self: BreakpointManager) !u32 {
-        for (0..4) |i| {
-            const id = @as(u32, @intCast(i));
-            var found = false;
-            for (self.breakpoints.items) |bp| {
-                if (bp.id == id) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                return id;
-            }
+    pub fn addBreakpoint(self: *Self, addr: u64) !void {
+        // Check if we already have 4 breakpoints (hardware limit)
+        if (self.breakpoints.items.len >= 4) {
+            print("Maximum of 4 hardware breakpoints supported\n", .{});
+            return;
         }
-        return error.TooManyBreakpoints;
-    }
 
-    pub fn addBreakpoint(self: *BreakpointManager, addr: u64) !void {
-        const id = try self.getFreeId();
-        try self.breakpoints.append(Breakpoint{ .addr = addr, .id = id });
+        const breakpoint = Breakpoint{
+            .addr = addr,
+            .id = self.next_id,
+        };
+
+        try self.breakpoints.append(breakpoint);
+        self.next_id += 1;
 
         // Sort by ID
         std.mem.sort(Breakpoint, self.breakpoints.items, {}, struct {
-            fn lessThan(_: void, a: Breakpoint, b: Breakpoint) bool {
-                return a.id < b.id;
+            fn lessThan(_: void, lhs: Breakpoint, rhs: Breakpoint) bool {
+                return lhs.id < rhs.id;
             }
         }.lessThan);
+
+        print("Breakpoint {} set at 0x{x}\n", .{ breakpoint.id, addr });
     }
 
-    pub fn listBreakpoints(self: BreakpointManager, proc: *process.Process) void {
+    pub fn listBreakpoints(self: *const Self, allocator: Allocator, process_info: anytype) void {
         if (self.breakpoints.items.len == 0) {
             print("No breakpoints set\n", .{});
             return;
         }
 
-        print("ID  Address            Status    Symbol\n", .{});
-        print("--  ----------------   -------   ------\n", .{});
-
         for (self.breakpoints.items) |bp| {
-            const status = if (bp.id < 4) "Active" else "Invalid";
-            if (name_resolution.resolveAddressToName(self.allocator, bp.addr, proc)) |sym_opt| {
-                if (sym_opt) |sym| {
-                    print("{:2}  0x{X:0>16} {s:>7}   {s}\n", .{ bp.id, bp.addr, status, sym });
-                    self.allocator.free(sym);
+            if (name_resolution.resolveAddressToName(allocator, bp.addr, process_info)) |sym| {
+                if (sym) |s| {
+                    print("{:3} 0x{x:0>16} ({s})\n", .{ bp.id, bp.addr, s });
+                    allocator.free(s);
                 } else {
-                    print("{:2}  0x{X:0>16} {s:>7}\n", .{ bp.id, bp.addr, status });
+                    print("{:3} 0x{x:0>16}\n", .{ bp.id, bp.addr });
                 }
             } else |_| {
-                print("{:2}  0x{X:0>16} {s:>7}\n", .{ bp.id, bp.addr, status });
+                print("{:3} 0x{x:0>16}\n", .{ bp.id, bp.addr });
             }
         }
-        print("\n", .{});
     }
 
-    pub fn clearBreakpointById(self: *BreakpointManager, id: u32) bool {
+    pub fn clearBreakpoint(self: *Self, id: u32) void {
         var i: usize = 0;
         while (i < self.breakpoints.items.len) {
             if (self.breakpoints.items[i].id == id) {
                 _ = self.breakpoints.orderedRemove(i);
-                return true;
+                print("Breakpoint {} cleared\n", .{id});
+                return;
             }
             i += 1;
         }
-        return false;
+        print("Breakpoint {} not found\n", .{id});
     }
 
-    pub fn clearBreakpointByAddress(self: *BreakpointManager, addr: u64) bool {
-        var i: usize = 0;
-        while (i < self.breakpoints.items.len) {
-            if (self.breakpoints.items[i].addr == addr) {
-                _ = self.breakpoints.orderedRemove(i);
-                return true;
-            }
-            i += 1;
-        }
-        return false;
-    }
-
-    pub fn findBreakpointByAddress(self: BreakpointManager, addr: u64) ?u32 {
-        for (self.breakpoints.items) |bp| {
-            if (bp.addr == addr) {
-                return bp.id;
-            }
-        }
-        return null;
-    }
-
-    pub fn wasBreakpointHit(self: BreakpointManager, thread_context: *const CONTEXT) ?u32 {
-        for (0..self.breakpoints.items.len) |idx| {
-            if (getBit(thread_context.Dr6, DR6_B_BIT[idx])) {
-                // return @intCast(idx);
+    pub fn wasBreakpointHit(self: *const Self, context: windows.CONTEXT) ?u32 {
+        for (self.breakpoints.items, 0..) |_, idx| {
+            if (util.getBit(context.Dr6, DR6_B_BIT[idx])) {
                 return self.breakpoints.items[idx].id;
             }
         }
         return null;
     }
 
-    pub fn applyBreakpoints(self: *BreakpointManager, proc: *process.Process, resume_thread_id: u32, mem_source: memory.MemorySource) void {
-        _ = mem_source; // Currently unused
-
-        const threads = proc.iterateThreads();
-        for (threads) |thread_id| {
-            var ctx: AlignedContext = std.mem.zeroes(AlignedContext);
-            ctx.context.ContextFlags = util.CONTEXT_ALL;
-
-            var thread_handle = AutoClosedHandle.init(OpenThread(
+    pub fn applyBreakpoints(self: *Self, process_info: anytype, resume_thread_id: u32) void {
+        // Apply breakpoints to all threads
+        for (process_info.thread_ids.items) |thread_id| {
+            var thread = AutoClosedHandle.init(OpenThread(
                 THREAD_GET_CONTEXT | THREAD_SET_CONTEXT,
                 FALSE,
                 thread_id,
             ));
-            defer thread_handle.deinit();
+            defer thread.deinit();
 
-            const ret = GetThreadContext(thread_handle.get(), &ctx.context);
-            if (ret == 0) {
-                print("Could not get thread context of thread {X}\n", .{thread_id});
+            if (thread.getHandle() == windows.INVALID_HANDLE_VALUE) {
                 continue;
             }
 
-            // Hardware breakpoints are limited to 4
+            var ctx = AlignedContext.init();
+            ctx.context.ContextFlags = CONTEXT_ALL;
+
+            const get_result = GetThreadContext(thread.getHandle(), &ctx.context);
+            if (get_result == 0) {
+                continue;
+            }
+
+            // Set resume flag for the thread that caused the break
+            if (thread_id == resume_thread_id) {
+                util.setBits(&ctx.context.EFlags, 1, EFLAG_RF, 1);
+            }
+
+            // Apply breakpoints to debug registers
             for (0..4) |idx| {
                 if (self.breakpoints.items.len > idx) {
                     // Set LEN to 0 (1 byte), RW to 0 (execute), LE to 1 (enabled)
-                    setBits(&ctx.context.Dr7, 0, DR7_LEN_BIT[idx], DR7_LEN_SIZE);
-                    setBits(&ctx.context.Dr7, 0, DR7_RW_BIT[idx], DR7_RW_SIZE);
-                    setBits(&ctx.context.Dr7, 1, DR7_LE_BIT[idx], 1);
+                    util.setBits(&ctx.context.Dr7, 0, DR7_LEN_BIT[idx], DR7_LEN_SIZE);
+                    util.setBits(&ctx.context.Dr7, 0, DR7_RW_BIT[idx], DR7_RW_SIZE);
+                    util.setBits(&ctx.context.Dr7, 1, DR7_LE_BIT[idx], 1);
 
                     // Set the breakpoint address
                     switch (idx) {
@@ -205,33 +221,11 @@ pub const BreakpointManager = struct {
                     }
                 } else {
                     // Disable unused breakpoints
-                    setBits(&ctx.context.Dr7, 0, DR7_LE_BIT[idx], 1);
-                    break;
+                    util.setBits(&ctx.context.Dr7, 0, DR7_LE_BIT[idx], 1);
                 }
             }
 
-            // Prevent current thread from hitting breakpoint on current instruction
-            // Set resume flag for the thread that caused the break
-            if (thread_id == resume_thread_id) {
-                setBits(&ctx.context.EFlags, 1, EFLAG_RF, 1);
-            }
-
-            const set_ret = SetThreadContext(thread_handle.get(), &ctx.context);
-            if (set_ret == 0) {
-                print("Could not set thread context of thread {X}\n", .{thread_id});
-            }
+            _ = SetThreadContext(thread.getHandle(), &ctx.context);
         }
     }
 };
-
-// Bit manipulation helper functions
-fn setBits(val: anytype, set_val: @TypeOf(val.*), start_bit: usize, bit_count: usize) void {
-    const T = @TypeOf(val.*);
-    const mask: T = (@as(T, 1) << @intCast(bit_count)) - 1;
-    const shifted_mask = mask << @intCast(start_bit);
-    val.* = (val.* & ~shifted_mask) | ((set_val & mask) << @intCast(start_bit));
-}
-
-fn getBit(val: u64, bit_pos: usize) bool {
-    return (val & (@as(u64, 1) << @intCast(bit_pos))) != 0;
-}
