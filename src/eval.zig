@@ -1,8 +1,10 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Process = @import("./process.zig").Process;
-const resolveNameToAddress = @import("./name_resolution.zig").resolveNameToAddress;
 const print = std.debug.print;
+
+const util = @import("util.zig");
+const Process = @import("process.zig").Process;
+const resolveNameToAddress = @import("name_resolution.zig").resolveNameToAddress;
 
 // Expression types for evaluation
 pub const EvalExpr = union(enum) {
@@ -65,21 +67,10 @@ pub fn parseExpression(allocator: Allocator, text: []const u8) !EvalExpr {
     }
 
     // No addition operator found, parse as number
-    const num = parseInt(trimmed) catch |err| {
+    const num = util.parseInt(trimmed) catch |err| {
         print("Failed to parse number: {s}\n", .{trimmed});
         return err;
     };
 
     return EvalExpr{ .Number = num };
-}
-
-// Parse integer from string (hex or decimal)
-fn parseInt(text: []const u8) !u64 {
-    const trimmed = std.mem.trim(u8, text, " \t");
-    if (std.mem.startsWith(u8, trimmed, "0x") or std.mem.startsWith(u8, trimmed, "0X")) {
-        const hex_part = trimmed[2..];
-        return try std.fmt.parseInt(u64, hex_part, 16);
-    } else {
-        return try std.fmt.parseInt(u64, trimmed, 10);
-    }
 }

@@ -1,159 +1,132 @@
 const std = @import("std");
-const print = std.debug.print;
 const Allocator = std.mem.Allocator;
-const eval = @import("eval.zig");
-const EvalExpr = eval.EvalExpr;
+const print = std.debug.print;
 
-// Command types supported by the debugger
-pub const CommandExpr = union(enum) {
+const eval = @import("eval.zig");
+const process_mod = @import("process.zig");
+
+// Command enumeration with parameters
+pub const Command = union(enum) {
     StepInto,
     Go,
-    SetBreakpoint: EvalExpr,
-    ListBreakpoints,
-    ClearBreakpoint: EvalExpr,
     DisplayRegisters,
-    StackWalk,
-    DisplayBytes: EvalExpr,
-    Evaluate: EvalExpr,
-    ListNearest: EvalExpr,
+    DisplayBytes: u64,
+    Evaluate: u64,
+    ListNearest: u64,
+    SetBreakpoint: u64,
+    ListBreakpoints,
+    ClearBreakpoint: u32,
+    CallStack,
     Quit,
-    Help,
-    Invalid: []u8,
-
-    const Self = @This();
-
-    pub fn deinit(self: *Self, allocator: Allocator) void {
-        switch (self.*) {
-            .SetBreakpoint => |*expr| expr.deinit(allocator),
-            .ClearBreakpoint => |*expr| expr.deinit(allocator),
-            .DisplayBytes => |*expr| expr.deinit(allocator),
-            .Evaluate => |*expr| expr.deinit(allocator),
-            .ListNearest => |*expr| expr.deinit(allocator),
-            .Invalid => |msg| allocator.free(msg),
-            else => {},
-        }
-    }
+    Unknown,
 };
 
-// Simple command parser
-fn parseCommand(allocator: Allocator, input: []const u8) !CommandExpr {
-    const trimmed = std.mem.trim(u8, input, " \t\r\n");
-    if (trimmed.len == 0) {
-        return CommandExpr{ .Invalid = try allocator.dupe(u8, "Empty command") };
-    }
-
-    // Split command and arguments
-    var parts = std.mem.splitScalar(u8, trimmed, ' ');
-    const command = parts.next() orelse return CommandExpr{ .Invalid = try allocator.dupe(u8, "No command") };
-
-    // Parse single-character commands
-    if (std.mem.eql(u8, command, "t")) {
-        return CommandExpr.StepInto;
-    } else if (std.mem.eql(u8, command, "g")) {
-        return CommandExpr.Go;
-    } else if (std.mem.eql(u8, command, "r")) {
-        return CommandExpr.DisplayRegisters;
-    } else if (std.mem.eql(u8, command, "k")) {
-        return CommandExpr.StackWalk;
-    } else if (std.mem.eql(u8, command, "q")) {
-        return CommandExpr.Quit;
-    } else if (std.mem.eql(u8, command, "bl")) {
-        return CommandExpr.ListBreakpoints;
-    } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "h")) {
-        return CommandExpr.Help;
-    }
-
-    // Parse commands with arguments
-    const rest_of_line = parts.rest();
-    if (rest_of_line.len == 0) {
-        const error_msg = try std.fmt.allocPrint(allocator, "Command '{s}' requires an argument", .{command});
-        return CommandExpr{ .Invalid = error_msg };
-    }
-
-    if (std.mem.eql(u8, command, "bp")) {
-        const expr = eval.parseExpression(allocator, rest_of_line) catch |err| {
-            const error_msg = try std.fmt.allocPrint(allocator, "Failed to parse breakpoint expression: {any}", .{err});
-            return CommandExpr{ .Invalid = error_msg };
-        };
-        return CommandExpr{ .SetBreakpoint = expr };
-    } else if (std.mem.eql(u8, command, "bc")) {
-        const expr = eval.parseExpression(allocator, rest_of_line) catch |err| {
-            const error_msg = try std.fmt.allocPrint(allocator, "Failed to parse clear breakpoint expression: {any}", .{err});
-            return CommandExpr{ .Invalid = error_msg };
-        };
-        return CommandExpr{ .ClearBreakpoint = expr };
-    } else if (std.mem.eql(u8, command, "db")) {
-        const expr = eval.parseExpression(allocator, rest_of_line) catch |err| {
-            const error_msg = try std.fmt.allocPrint(allocator, "Failed to parse memory display expression: {any}", .{err});
-            return CommandExpr{ .Invalid = error_msg };
-        };
-        return CommandExpr{ .DisplayBytes = expr };
-    } else if (std.mem.eql(u8, command, "?")) {
-        const expr = eval.parseExpression(allocator, rest_of_line) catch |err| {
-            const error_msg = try std.fmt.allocPrint(allocator, "Failed to parse evaluate expression: {any}", .{err});
-            return CommandExpr{ .Invalid = error_msg };
-        };
-        return CommandExpr{ .Evaluate = expr };
-    } else if (std.mem.eql(u8, command, "ln")) {
-        const expr = eval.parseExpression(allocator, rest_of_line) catch |err| {
-            const error_msg = try std.fmt.allocPrint(allocator, "Failed to parse list nearest expression: {any}", .{err});
-            return CommandExpr{ .Invalid = error_msg };
-        };
-        return CommandExpr{ .ListNearest = expr };
-    }
-
-    const error_msg = try std.fmt.allocPrint(allocator, "Unknown command: '{s}'", .{command});
-    return CommandExpr{ .Invalid = error_msg };
-}
-
-// Read and parse a command from user input
-pub fn readCommand(allocator: Allocator) !CommandExpr {
+// Extended command parsing with expressions and breakpoints
+pub fn readCommand(allocator: Allocator, process_info: *process_mod.Process) !Command {
     const stdin = std.io.getStdIn().reader();
 
     while (true) {
-        // Print prompt
-        try std.io.getStdOut().writer().print("> ", .{});
+        print("> ", .{});
 
-        // Read line
-        var input_buffer: [1024]u8 = undefined;
-        if (try stdin.readUntilDelimiterOrEof(input_buffer[0..], '\n')) |input| {
-            const command = parseCommand(allocator, input) catch |err| {
-                print("Error parsing command: {any}\n", .{err});
-                continue;
-            };
+        var input_buffer: [256]u8 = undefined;
+        if (stdin.readUntilDelimiterOrEof(&input_buffer, '\n')) |maybe_input| {
+            if (maybe_input) |input| {
+                const trimmed = std.mem.trim(u8, input, " \t\r\n");
 
-            // Check if it's an invalid command and display the error
-            switch (command) {
-                .Invalid => |msg| {
-                    print("Error: {s}\n", .{msg});
-                    var cmd_copy = command;
-                    cmd_copy.deinit(allocator);
+                if (trimmed.len == 0) continue;
+
+                if (std.mem.eql(u8, trimmed, "t")) {
+                    return Command.StepInto;
+                } else if (std.mem.eql(u8, trimmed, "g")) {
+                    return Command.Go;
+                } else if (std.mem.eql(u8, trimmed, "r")) {
+                    return Command.DisplayRegisters;
+                } else if (std.mem.eql(u8, trimmed, "q")) {
+                    return Command.Quit;
+                } else if (std.mem.eql(u8, trimmed, "bl")) {
+                    return Command.ListBreakpoints;
+                } else if (std.mem.eql(u8, trimmed, "k")) {
+                    return Command.CallStack;
+                } else if (std.mem.startsWith(u8, trimmed, "bp ")) {
+                    const expr_text = trimmed[3..];
+                    var expr = eval.parseExpression(allocator, expr_text) catch {
+                        print("Invalid expression in bp command\n", .{});
+                        continue;
+                    };
+                    defer expr.deinit(allocator);
+                    const addr = expr.evaluate(allocator, process_info) catch |err| {
+                        print("Failed to evaluate breakpoint address: {any}\n", .{err});
+                        continue;
+                    };
+                    return Command{ .SetBreakpoint = addr };
+                } else if (std.mem.startsWith(u8, trimmed, "bc ")) {
+                    const expr_text = trimmed[3..];
+                    var expr = eval.parseExpression(allocator, expr_text) catch {
+                        print("Invalid expression in bc command\n", .{});
+                        continue;
+                    };
+                    defer expr.deinit(allocator);
+                    const id = expr.evaluate(allocator, process_info) catch |err| {
+                        print("Failed to evaluate breakpoint ID: {any}\n", .{err});
+                        continue;
+                    };
+                    return Command{ .ClearBreakpoint = @intCast(id) };
+                } else if (std.mem.startsWith(u8, trimmed, "db ")) {
+                    const expr_text = trimmed[3..];
+                    var expr = eval.parseExpression(allocator, expr_text) catch {
+                        print("Invalid expression in db command\n", .{});
+                        continue;
+                    };
+                    defer expr.deinit(allocator);
+                    const addr = expr.evaluate(allocator, process_info) catch |err| {
+                        print("Failed to evaluate address: {any}\n", .{err});
+                        continue;
+                    };
+                    return Command{ .DisplayBytes = addr };
+                } else if (std.mem.startsWith(u8, trimmed, "ln ")) {
+                    const expr_text = trimmed[3..];
+                    var expr = eval.parseExpression(allocator, expr_text) catch {
+                        print("Invalid expression in ln command\n", .{});
+                        continue;
+                    };
+                    defer expr.deinit(allocator);
+                    const addr = expr.evaluate(allocator, process_info) catch |err| {
+                        print("Failed to evaluate address: {any}\n", .{err});
+                        continue;
+                    };
+                    return Command{ .ListNearest = addr };
+                } else if (std.mem.startsWith(u8, trimmed, "? ")) {
+                    const expr_text = trimmed[2..];
+                    var expr = eval.parseExpression(allocator, expr_text) catch {
+                        print("Invalid expression in ? command\n", .{});
+                        continue;
+                    };
+                    defer expr.deinit(allocator);
+                    const value = expr.evaluate(allocator, process_info) catch |err| {
+                        print("Failed to evaluate expression: {any}\n", .{err});
+                        continue;
+                    };
+                    return Command{ .Evaluate = value };
+                } else {
+                    print("Unknown command: {s}\n", .{trimmed});
+                    print("Available commands:\n", .{});
+                    print("  t - step into\n", .{});
+                    print("  g - go (continue)\n", .{});
+                    print("  r - display registers\n", .{});
+                    print("  db <addr> - display bytes at address\n", .{});
+                    print("  ln <addr> - list nearest symbol to address\n", .{});
+                    print("  ? <expr> - evaluate expression\n", .{});
+                    print("  bp <addr> - set breakpoint at address\n", .{});
+                    print("  bl - list breakpoints\n", .{});
+                    print("  bc <id> - clear breakpoint by ID\n", .{});
+                    print("  k - display call stack\n", .{});
+                    print("  q - quit\n", .{});
                     continue;
-                },
-                else => return command,
+                }
             }
+        } else |_| {
+            // EOF or error
+            return Command.Quit;
         }
     }
-}
-
-// Display help information
-pub fn displayHelp() void {
-    print("Available commands:\n", .{});
-    print("  t            - Step into (single step)\n", .{});
-    print("  g            - Go (continue execution)\n", .{});
-    print("  bp <expr>    - Set breakpoint at address/symbol\n", .{});
-    print("  bl           - List breakpoints\n", .{});
-    print("  bc <expr>    - Clear breakpoint\n", .{});
-    print("  r            - Display registers\n", .{});
-    print("  k            - Stack walk\n", .{});
-    print("  db <expr>    - Display bytes at address\n", .{});
-    print("  ? <expr>     - Evaluate expression\n", .{});
-    print("  ln <expr>    - List nearest symbols\n", .{});
-    print("  q            - Quit\n", .{});
-    print("  help         - Show this help\n", .{});
-    print("\n", .{});
-    print("Expressions can be:\n", .{});
-    print("  - Numbers: 123, 0x1234\n", .{});
-    print("  - Symbols: module!symbol\n", .{});
-    print("  - Arithmetic: expr + expr\n", .{});
 }
