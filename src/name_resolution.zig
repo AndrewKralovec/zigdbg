@@ -2,10 +2,11 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const print = std.debug.print;
 
-const process_mod = @import("process.zig");
+const Process = @import("process.zig").Process;
+const Export = @import("module.zig").Export;
 
 // Resolve symbol name to address
-pub fn resolveNameToAddress(sym: []const u8, process: *process_mod.Process) !u64 {
+pub fn resolveNameToAddress(sym: []const u8, process: *Process) !u64 {
     if (std.mem.indexOf(u8, sym, "!")) |pos| {
         // Fully qualified name: module!function
         const module_name = sym[0..pos];
@@ -27,10 +28,10 @@ pub fn resolveNameToAddress(sym: []const u8, process: *process_mod.Process) !u64
 }
 
 // Resolve address to symbol name
-pub fn resolveAddressToName(allocator: Allocator, address: u64, process_info: *process_mod.Process) !?[]u8 {
+pub fn resolveAddressToName(allocator: Allocator, address: u64, process_info: *Process) !?[]u8 {
     const module = process_info.getContainingModule(address) orelse return null;
 
-    var closest_export: ?*process_mod.Export = null;
+    var closest_export: ?*Export = null;
     var closest_addr: u64 = 0;
 
     // Find the closest export that comes before the address

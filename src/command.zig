@@ -3,7 +3,7 @@ const Allocator = std.mem.Allocator;
 const print = std.debug.print;
 
 const eval = @import("eval.zig");
-const process_mod = @import("process.zig");
+const Process = @import("process.zig").Process;
 
 // Command enumeration with parameters
 pub const Command = union(enum) {
@@ -22,7 +22,7 @@ pub const Command = union(enum) {
 };
 
 // Extended command parsing with expressions and breakpoints
-pub fn readCommand(allocator: Allocator, process_info: *process_mod.Process) !Command {
+pub fn readCommand(allocator: Allocator, process_info: *Process) !Command {
     const stdin = std.io.getStdIn().reader();
 
     while (true) {

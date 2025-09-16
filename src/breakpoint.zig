@@ -6,7 +6,7 @@ const Allocator = std.mem.Allocator;
 
 const memory = @import("./memory.zig");
 const util = @import("./util.zig");
-const resolveAddressToName = @import("./name_resolution.zig").resolveAddressToName;
+const name_resolution = @import("name_resolution.zig");
 
 // Thread access rights
 const THREAD_GET_CONTEXT = 0x0008;
@@ -141,7 +141,7 @@ pub const BreakpointManager = struct {
         }
 
         for (self.breakpoints.items) |bp| {
-            if (resolveAddressToName(allocator, bp.addr, process_info)) |sym| {
+            if (name_resolution.resolveAddressToName(allocator, bp.addr, process_info)) |sym| {
                 if (sym) |s| {
                     print("{:3} 0x{x:0>16} ({s})\n", .{ bp.id, bp.addr, s });
                     allocator.free(s);

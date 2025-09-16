@@ -3,8 +3,8 @@ const Allocator = std.mem.Allocator;
 const print = std.debug.print;
 
 const util = @import("util.zig");
+const name_resolution = @import("name_resolution.zig");
 const Process = @import("process.zig").Process;
-const resolveNameToAddress = @import("name_resolution.zig").resolveNameToAddress;
 
 // Expression types for evaluation
 pub const EvalExpr = union(enum) {
@@ -33,7 +33,7 @@ pub const EvalExpr = union(enum) {
     pub fn evaluate(self: *const Self, allocator: Allocator, process_info: *Process) !u64 {
         return switch (self.*) {
             .Number => |n| n,
-            .Symbol => |sym| try resolveNameToAddress(sym, process_info),
+            .Symbol => |sym| try name_resolution.resolveNameToAddress(sym, process_info),
             .Add => |add| (try add.left.evaluate(allocator, process_info)) + (try add.right.evaluate(allocator, process_info)),
         };
     }

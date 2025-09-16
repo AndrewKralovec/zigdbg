@@ -4,7 +4,10 @@ const print = std.debug.print;
 const Allocator = std.mem.Allocator;
 
 const memory = @import("memory.zig");
-const process_mod = @import("process.zig");
+const Process = @import("process.zig").Process;
+
+const IMAGE_DOS_HEADER = @import("module.zig").IMAGE_DOS_HEADER;
+const IMAGE_NT_HEADERS64 = @import("module.zig").IMAGE_NT_HEADERS64;
 
 // Exception directory entry index
 const IMAGE_DIRECTORY_ENTRY_EXCEPTION = 3;
@@ -53,20 +56,20 @@ pub const StackFrame = struct {
 };
 
 // Stack unwinding functions
-pub fn findRuntimeFunction(process_info: *process_mod.Process, process: windows.HANDLE, rip: u64) ?RUNTIME_FUNCTION {
+pub fn findRuntimeFunction(process_info: *Process, process: windows.HANDLE, rip: u64) ?RUNTIME_FUNCTION {
     const module = process_info.getContainingModule(rip) orelse {
         return null;
     };
 
     // Read exception directory from PE headers
-    const dos_header = memory.readProcessMemoryData(process_mod.IMAGE_DOS_HEADER, process, module.base_address) catch |err| {
+    const dos_header = memory.readProcessMemoryData(IMAGE_DOS_HEADER, process, module.base_address) catch |err| {
         print("Failed to read DOS header: {any}\n", .{err});
         return null;
     };
     if (dos_header.e_magic != IMAGE_DOS_SIGNATURE) return null;
 
     const pe_header_addr = module.base_address + @as(u64, @intCast(dos_header.e_lfanew));
-    const pe_header = memory.readProcessMemoryData(process_mod.IMAGE_NT_HEADERS64, process, pe_header_addr) catch |err| {
+    const pe_header = memory.readProcessMemoryData(IMAGE_NT_HEADERS64, process, pe_header_addr) catch |err| {
         print("Failed to read PE header: {any}\n", .{err});
         return null;
     };
@@ -107,7 +110,7 @@ pub fn findRuntimeFunction(process_info: *process_mod.Process, process: windows.
     return null;
 }
 
-pub fn unwindContext(allocator: Allocator, process_info: *process_mod.Process, process: windows.HANDLE, context: windows.CONTEXT) ?windows.CONTEXT {
+pub fn unwindContext(allocator: Allocator, process_info: *Process, process: windows.HANDLE, context: windows.CONTEXT) ?windows.CONTEXT {
     const runtime_func = findRuntimeFunction(process_info, process, context.Rip) orelse {
         return null;
     };
