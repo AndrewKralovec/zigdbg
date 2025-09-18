@@ -1,3 +1,6 @@
+//! COM utilities and RAII wrappers for DbgEng interfaces
+//! This module provides safe COM initialization, cleanup, and RAII wrappers
+
 const std = @import("std");
 const windows = std.os.windows;
 const com_interfaces = @import("com_interfaces.zig");

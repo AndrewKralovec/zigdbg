@@ -1,3 +1,6 @@
+//! COM interface definitions for Windows DbgEng API
+//! This module provides Zig bindings for the essential DbgEng COM interfaces
+
 const std = @import("std");
 const windows = std.os.windows;
 

@@ -1,7 +1,11 @@
+//! Main DbgEng client wrapper that encapsulates all DbgEng interfaces
+//! This module provides the primary interface for the debugger
+
 const std = @import("std");
 const windows = std.os.windows;
 const com_interfaces = @import("com_interfaces.zig");
 const com_utils = @import("com_utils.zig");
+const process_manager = @import("process_manager.zig");
 
 // Import essential types
 const HRESULT = com_interfaces.HRESULT;
@@ -31,6 +35,9 @@ const succeeded = com_utils.succeeded;
 const failed = com_utils.failed;
 const hresultWrap = com_utils.hresultWrap;
 const debugPrintHresult = com_utils.debugPrintHresult;
+
+// Import process manager
+const ProcessManager = process_manager.ProcessManager;
 
 // Debug status constants from com_interfaces
 const DEBUG_STATUS_NO_CHANGE = com_interfaces.DEBUG_STATUS_NO_CHANGE;
@@ -71,6 +78,9 @@ pub const DbgEngClient = struct {
     // Core interfaces
     client: ComClient,
     control: ComControl,
+
+    // Process manager for handling process operations and events
+    process_manager: ProcessManager,
 
     // Additional interfaces (to be added as needed)
     symbols: ?*anyopaque = null,
@@ -126,12 +136,21 @@ pub const DbgEngClient = struct {
             std.debug.print("IDebugControl4 interface obtained successfully\n", .{});
         }
 
+        // Initialize process manager
+        var proc_manager = ProcessManager.init(allocator);
+        try proc_manager.setInterfaces(debug_client, control.getRequired());
+
+        if (config.verbose_logging) {
+            std.debug.print("Process manager initialized with event callbacks\n", .{});
+        }
+
         return Self{
             .allocator = allocator,
             .config = config,
             .com_init = com_init,
             .client = client,
             .control = control,
+            .process_manager = proc_manager,
         };
     }
 
@@ -148,6 +167,9 @@ pub const DbgEngClient = struct {
             };
         }
 
+        // Clean up process manager
+        self.process_manager.deinit();
+
         // Release COM interfaces
         self.control.deinit();
         self.client.deinit();
@@ -161,50 +183,79 @@ pub const DbgEngClient = struct {
     }
 
     /// Create a new process and attach the debugger to it
+    /// This now uses the ProcessManager with callback-driven events
     pub fn createProcess(self: *Self, command_line: []const u8) !void {
         if (self.config.verbose_logging) {
             std.debug.print("Creating process: {s}\n", .{command_line});
         }
 
-        // Convert command line to wide string
-        var wide_cmd = try WideString.init(self.allocator, command_line);
-        defer wide_cmd.deinit();
-
-        // Create the process
-        const flags = DEBUG_PROCESS_ONLY_THIS_PROCESS | DEBUG_CREATE_PROCESS_NO_DEBUG_HEAP;
-        const hr = self.client.getRequired().createProcessWide(null, @constCast(wide_cmd.ptr()), flags);
-
-        if (failed(hr)) {
-            debugPrintHresult(hr, "CreateProcessWide failed");
-            return error.ProcessCreationFailed;
-        }
+        // Use the process manager to create the process
+        try self.process_manager.createProcess(command_line);
 
         self.is_attached = true;
 
+        // Start the callback-driven debug session
+        try self.process_manager.startSession();
+
         if (self.config.verbose_logging) {
-            std.debug.print("Process created successfully\n", .{});
+            std.debug.print("Process created successfully with event callbacks active\n", .{});
         }
     }
 
     /// Attach to an existing process by process ID
     pub fn attachProcess(self: *Self, process_id: u32, noninvasive: bool) !void {
+        _ = noninvasive; // TODO: Implement noninvasive attachment in ProcessManager
+
         if (self.config.verbose_logging) {
             std.debug.print("Attaching to process ID: {}\n", .{process_id});
         }
 
-        const flags: ULONG = if (noninvasive) DEBUG_ATTACH_NONINVASIVE else DEBUG_ATTACH_EXISTING;
-        const hr = self.client.getRequired().attachProcess(null, process_id, flags);
-
-        if (failed(hr)) {
-            debugPrintHresult(hr, "AttachProcess failed");
-            return error.ProcessAttachFailed;
-        }
+        // Use the process manager to attach to the process
+        try self.process_manager.attachToProcess(process_id);
 
         self.is_attached = true;
         self.current_process_id = process_id;
 
+        // Start the callback-driven debug session
+        try self.process_manager.startSession();
+
         if (self.config.verbose_logging) {
-            std.debug.print("Successfully attached to process {}\n", .{process_id});
+            std.debug.print("Successfully attached to process {} with event callbacks active\n", .{process_id});
+        }
+    }
+
+    /// Attach to an existing process by executable name
+    pub fn attachProcessByName(self: *Self, executable_name: []const u8) !void {
+        if (self.config.verbose_logging) {
+            std.debug.print("Attaching to process by name: {s}\n", .{executable_name});
+        }
+
+        // Use the process manager to find and attach to the process
+        try self.process_manager.attachToProcessByName(executable_name);
+
+        self.is_attached = true;
+
+        // Start the callback-driven debug session
+        try self.process_manager.startSession();
+
+        if (self.config.verbose_logging) {
+            std.debug.print("Successfully attached to process '{s}' with event callbacks active\n", .{executable_name});
+        }
+    }
+
+    /// Open a dump file for analysis
+    pub fn openDumpFile(self: *Self, dump_file_path: []const u8) !void {
+        if (self.config.verbose_logging) {
+            std.debug.print("Opening dump file: {s}\n", .{dump_file_path});
+        }
+
+        // Use the process manager to open the dump file
+        try self.process_manager.openDumpFile(dump_file_path);
+
+        self.is_attached = true;
+
+        if (self.config.verbose_logging) {
+            std.debug.print("Dump file opened successfully: {s}\n", .{dump_file_path});
         }
     }
 
@@ -306,24 +357,16 @@ pub const DbgEngClient = struct {
         }
     }
 
-    /// Wait for a debug event
-    pub fn waitForEvent(self: *Self, timeout_ms: ?u32) !void {
+    /// Wait for debug events using the callback-driven model
+    /// This replaces the WaitForDebugEventEx loop
+    pub fn waitForEvents(self: *Self, timeout_ms: ?u32) !bool {
         const timeout = timeout_ms orelse self.config.default_timeout;
 
         if (self.config.verbose_logging) {
-            std.debug.print("Waiting for event (timeout: {}ms)...\n", .{timeout});
+            std.debug.print("Waiting for events via callbacks (timeout: {}ms)...\n", .{timeout});
         }
 
-        const hr = self.control.getRequired().waitForEvent(0, timeout);
-
-        if (failed(hr)) {
-            debugPrintHresult(hr, "WaitForEvent failed");
-            return error.EventWaitFailed;
-        }
-
-        if (self.config.verbose_logging) {
-            std.debug.print("Event received\n", .{});
-        }
+        return self.process_manager.waitForEvents(timeout);
     }
 
     /// Get current execution status
@@ -387,7 +430,11 @@ pub const DbgEngClient = struct {
             else => "UNKNOWN",
         };
 
-        const message = std.fmt.allocPrint(self.allocator, "Debugger Status: {s} ({})\n", .{ status_text, status }) catch return error.OutputFailed;
+        const message = std.fmt.allocPrint(
+            self.allocator,
+            "Debugger Status: {s} ({})\n",
+            .{ status_text, status }
+        ) catch return error.OutputFailed;
         defer self.allocator.free(message);
 
         try self.output(message);
